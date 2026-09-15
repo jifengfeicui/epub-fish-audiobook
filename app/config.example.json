@@ -1,0 +1,14 @@
+{
+  "llm": {
+    "base_url": "http://localhost:1234/v1",
+    "api_key": "lm-studio",
+    "model_name": "replace-with-loaded-model-id"
+  },
+  "generation": {
+    "chunk_size": 2000,
+    "max_tokens": 8192,
+    "temperature": 0.2,
+    "top_p": 0.8,
+    "lossless_fallback": true
+  }
+}

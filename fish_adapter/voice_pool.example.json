@@ -1,0 +1,22 @@
+{
+  "bindings": {
+    "NARRATOR": {
+      "reference_id": "replace-with-narrator-reference-id",
+      "name": "Narrator"
+    },
+    "MAIN_CHARACTER": {
+      "reference_id": "replace-with-main-character-reference-id",
+      "name": "Main Character"
+    }
+  },
+  "pool": [
+    {
+      "reference_id": "replace-with-pool-reference-id-1",
+      "name": "Pool Voice 1"
+    },
+    {
+      "reference_id": "replace-with-pool-reference-id-2",
+      "name": "Pool Voice 2"
+    }
+  ]
+}

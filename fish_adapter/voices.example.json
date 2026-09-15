@@ -1,0 +1,10 @@
+{
+  "NARRATOR": {
+    "reference_id": "replace-with-fish-reference-id",
+    "name": "Narrator"
+  },
+  "CHARACTER_NAME": {
+    "reference_id": "replace-with-fish-reference-id",
+    "name": "Character Name"
+  }
+}

@@ -9,7 +9,7 @@ FORMAT:
 ]
 
 FIELDS:
-- "speaker": Character name in UPPERCASE. "NARRATOR" for ALL non-dialogue (descriptions, thoughts, actions, scene-setting).
+- "speaker": Use the canonical character name consistently. For Chinese names, preserve the exact original characters; do not translate, romanize, or force uppercase. Use "NARRATOR" for ALL non-dialogue (descriptions, thoughts, actions, scene-setting).
 - "text": Exactly what the TTS voice says.
 - "instruct": 1-2 sentence voice direction (~8-15 words) for the TTS engine.
 
@@ -18,26 +18,26 @@ RULES:
 1. NARRATOR vs CHARACTER (most important rule):
    CHARACTER = words spoken aloud (dialogue). NARRATOR = everything else (descriptions, actions, thoughts, internal monologue).
    - NEVER convert narration to dialogue. Third-person stays third-person:
-     WRONG: Source "He had always been a poor liar" → MARCUS: "I have always been a poor liar"
+     WRONG: Source "He had always been a poor liar." → MARCUS: "I have always been a poor liar."
      RIGHT: → NARRATOR: "He had always been a poor liar."
    - Split mixed paragraphs by tracking quotation marks — inside quotes = CHARACTER, outside = NARRATOR:
      Source: '"We should leave," he said, pulling on his coat. "Now, before they notice."'
-     → MARCUS: "We should leave." → NARRATOR: "Marcus pulled on his coat." → MARCUS: "Now, before they notice."
+     → MARCUS: "We should leave," → NARRATOR: "he said, pulling on his coat." → MARCUS: "Now, before they notice."
 
 2. PRESERVE THE AUTHOR'S TEXT. Do not change tense, person, or wording.
 
 3. NEVER remove narration. All narration must appear in output — standalone paragraphs, interleaved actions, and actions extracted from attribution tags.
 
-4. Drop attribution tags ("he said", "she replied") but ALWAYS extract descriptive actions as NARRATOR using the character's name (not a pronoun):
+4. Move attribution tags ("he said", "she replied") into NARRATOR entries and preserve their original wording:
    Source: '"There is nothing to tell," said Marcus, unable to meet her gaze.'
-   → MARCUS: "There is nothing to tell." → NARRATOR: "Marcus was unable to meet her gaze."
+   → MARCUS: "There is nothing to tell," → NARRATOR: "said Marcus, unable to meet her gaze."
 
 5. NARRATOR GROUPING: Keep consecutive narrator text in ONE entry unless the emotional tone genuinely shifts. Do not split narration sentence-by-sentence.
    EXCEPTION: Book titles, author names, dedications, chapter numbers, chapter titles, and other front-matter or structural text must each be their own separate entry — they are distinct items, not continuous narration. A bare chapter number ("1", "CHAPTER THREE") and its chapter title ("SPADE & ARCHER") may be combined into one entry ("1 SPADE & ARCHER").
 
 6. TEXT FORMATTING:
    - No bracket sounds ([gasps], <sigh>). Use real words: "Ah!", "Oh!", "Haha!", "Haah...", "Mmm..."
-   - Convert for TTS: "Chapter I" → "Chapter One", "Dr." → "Doctor", "Mr." → "Mister", "&" → "and", "3rd" → "third"
+   - Preserve abbreviations, numbers, symbols, punctuation, and original wording exactly. TTS-specific normalization happens after script validation.
    - Preserve internal quotation marks (quoted letters, foreign terms, emphasis) — only remove outermost dialogue quotes.
    - Characters reading documents aloud: attribute to the reader, not the document's author.
    - Non-human characters: describe through NARRATOR, no speaking lines.
@@ -49,6 +49,35 @@ RULES:
    - Describe the VOICE, not the body. "Shocked, voice breaking." NOT "Trembling with shock."
    - Convey pacing through energy: "urgent intensity" not "fast and urgent".
    - Each line is processed in isolation by TTS — give the instruct all needed context. Repeat emotional state explicitly ("Sad, quiet sobbing." not "still crying").
+
+8. CHINESE DIALOGUE AND NARRATION:
+   - Treat 「」, “”, and ‘’ as dialogue markers. Also recognize direct dialogue after a colon (: or ：), including dialogue without an explicit "he said" attribution.
+   - Track opening and closing quotation marks across a paragraph. Consecutive quoted sentences belong to the same speaker until narration or a new attribution clearly changes the speaker.
+   - Do not turn thoughts, actions, or scene description into dialogue. A sentence such as "林轩皱眉。" is NARRATOR unless the source explicitly presents spoken words.
+   - Move attribution phrases such as "他说" or "她问" out of spoken text into a separate NARRATOR entry. Keep the author's wording, tense, and punctuation.
+   - Use the exact surrounding character name for Chinese speakers, and keep every non-dialogue sentence under NARRATOR.
+   - Never use pronouns or addressee words such as 我, 你, 你们, 他, 她 as speaker names. Never emit placeholder speakers such as CHARACTER, SPEAKER, UNKNOWN, 人物, or 角色. If a canonical character name cannot be established from context, use NARRATOR rather than inventing a label.
+   - For a sustained first-person literary narrator with an established canonical identity (for example, 地下人), keep that identity as speaker across narration and rhetorical monologue. Rhetorical addresses to an imagined audience (for example, "你们") do not change the speaker and never create a speaker named "你们". Use NARRATOR only when no canonical first-person narrator identity is established.
+
+9. LOSSLESS TEXT CONTRACT:
+   - The concatenated output text must preserve every source character in the same order, except outer dialogue quotation marks and layout whitespace.
+   - Do not delete attribution phrases such as "他说" or "她问". Keep them verbatim as NARRATOR text. Do not rewrite pronouns to character names.
+   - Do not expand abbreviations, normalize chapter numbers, replace symbols, or otherwise rewrite source text. Text normalization belongs after script validation, not in this annotation step.
+
+CHINESE EXAMPLE:
+Source:
+林轩皱眉。
+
+“你到底想干什么？”
+
+他压低声音说道：“别再让我说第二遍。”
+Output:
+[
+  {"speaker": "NARRATOR", "text": "林轩皱眉。", "instruct": "Tense, restrained narration."},
+  {"speaker": "林轩", "text": "你到底想干什么？", "instruct": "Restrained anger, tense questioning voice."},
+  {"speaker": "NARRATOR", "text": "他压低声音说道：", "instruct": "Quiet, tense narration."},
+  {"speaker": "林轩", "text": "别再让我说第二遍。", "instruct": "Cold anger, low and threatening voice."}
+]
 ---SEPARATOR---
 {context}
 

@@ -1,0 +1,23 @@
+{
+  "api": {
+    "base_url": "https://api.fish.audio",
+    "model": "s2.1-pro-free",
+    "api_key_env": "FISH_API_KEY"
+  },
+  "tts": {
+    "format": "mp3",
+    "sample_rate": 44100,
+    "mp3_bitrate": 128,
+    "temperature": 0.7,
+    "top_p": 0.7,
+    "latency": "normal",
+    "condition_on_previous_chunks": true,
+    "timeout_seconds": 300
+  },
+  "render": {
+    "workers": 2,
+    "max_retries": 5,
+    "retry_backoff_seconds": [2, 5, 10, 20, 40],
+    "output_dir": "output"
+  }
+}

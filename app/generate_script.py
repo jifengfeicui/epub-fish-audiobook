@@ -5,10 +5,39 @@ import re
 import argparse
 from openai import OpenAI
 from default_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
+from script_validation import (
+    compare_text_fidelity,
+    format_fidelity_error,
+    normalize_unsafe_speakers,
+    validate_script_entries,
+)
 
 # Cap for single-speaker mode: entries at this size pass through
 # group_into_chunks (MAX_CHUNK_CHARS=500) as-is without further splitting.
 SINGLE_SPEAKER_MAX_CHARS = 500
+
+
+def build_lossless_fallback_entries(chunk, speaker_name, instruct="Neutral, even narration."):
+    """Preserve a failed first-person chunk verbatim without another LLM call."""
+    entries = []
+    for paragraph in re.split(r"\n\s*\n", chunk):
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+        for segment in split_into_chunks(paragraph, max_size=SINGLE_SPEAKER_MAX_CHARS):
+            stripped = segment.strip()
+            is_heading = bool(
+                re.fullmatch(
+                    r"(?:第[一二三四五六七八九十百零〇0-9]+章(?:\s+.+)?(?:\[\d+\])?|[一二三四五六七八九十百零〇0-9]+)",
+                    stripped,
+                )
+            )
+            entries.append({
+                "speaker": "NARRATOR" if is_heading else speaker_name,
+                "text": segment,
+                "instruct": instruct,
+            })
+    return entries
 
 def clean_json_string(text):
     """Clean and extract valid JSON array from LLM response."""
@@ -212,8 +241,24 @@ def split_into_chunks(text, max_size=3000):
                 current_chunk = ""
 
             if len(para) > max_size:
-                sentences = re.split(r'(?<=[.!?])\s+', para)
+                sentences = re.split(r'(?<=[。！？；])|(?<=[.!?;])\s+', para)
                 for sentence in sentences:
+                    sentence = sentence.strip()
+                    if not sentence:
+                        continue
+                    while len(sentence) > max_size:
+                        if current_chunk:
+                            chunks.append(current_chunk.strip())
+                            current_chunk = ""
+                        split_at = max(
+                            sentence.rfind(mark, max_size // 2, max_size)
+                            for mark in ("，", "、", ",", "：", ":")
+                        )
+                        split_at = split_at + 1 if split_at >= max_size // 2 else max_size
+                        chunks.append(sentence[:split_at].strip())
+                        sentence = sentence[split_at:].strip()
+                    if not sentence:
+                        continue
                     if len(current_chunk) + len(sentence) + 1 > max_size:
                         if current_chunk:
                             chunks.append(current_chunk.strip())
@@ -230,7 +275,7 @@ def split_into_chunks(text, max_size=3000):
 
     return chunks
 
-def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_entries=None, max_retries=2, system_prompt=None, user_prompt_template=None, max_tokens=4096, temperature=0.6, top_p=0.8, top_k=0, min_p=0, presence_penalty=0.0, banned_tokens=None):
+def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_entries=None, max_retries=2, system_prompt=None, user_prompt_template=None, max_tokens=4096, temperature=0.6, top_p=0.8, top_k=0, min_p=0, presence_penalty=0.0, banned_tokens=None, first_person_speaker=None):
     """Process a text chunk and return JSON script entries"""
     # Use provided prompts or fall back to defaults
     sys_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
@@ -260,16 +305,25 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
         for entry in tail:
             context_parts.append(json.dumps(entry, ensure_ascii=False))
 
+    if first_person_speaker:
+        context_parts.append(
+            f"Canonical speaker for the sustained first-person narrator: {first_person_speaker}. "
+            "Use this exact label for first-person narration and rhetorical addresses. "
+            "Never label the addressee (for example, 你们) as the speaker."
+        )
+
     context = "\n".join(context_parts)
     user_prompt = usr_template.format(context=context, chunk=chunk)
+    retry_feedback = ""
 
     for attempt in range(max_retries + 1):
         try:
+            request_prompt = user_prompt + retry_feedback
             response = client.chat.completions.create(
                 model=model_name,
                 messages=[
                     {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": user_prompt}
+                    {"role": "user", "content": request_prompt}
                 ],
                 temperature=temperature,
                 top_p=top_p,
@@ -331,9 +385,33 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
         entries = repair_json_array(json_text)
 
         if entries and len(entries) > 0:
-            if attempt > 0:
-                print(f"  Succeeded on retry {attempt + 1}")
-            return entries
+            entries, normalized_count = normalize_unsafe_speakers(entries, first_person_speaker)
+            if normalized_count:
+                print(f"  Normalized {normalized_count} unsafe speaker label(s) to {first_person_speaker!r}")
+            schema_errors = validate_script_entries(entries)
+            fidelity = compare_text_fidelity(chunk, entries)
+            if not schema_errors and fidelity.exact:
+                if attempt > 0:
+                    print(f"  Succeeded on retry {attempt + 1}")
+                return entries
+
+            if schema_errors:
+                print(f"  WARNING: Invalid script entries: {'; '.join(schema_errors[:3])}")
+            if not fidelity.exact:
+                print(f"  WARNING: Source text was not preserved: {format_fidelity_error(fidelity)}")
+            if attempt < max_retries:
+                problems = "; ".join(schema_errors[:3])
+                if not fidelity.exact:
+                    problems = (problems + "; " if problems else "") + format_fidelity_error(fidelity)
+                retry_feedback = (
+                    "\n\nVALIDATION FEEDBACK FOR RETRY:\n"
+                    f"Your previous answer was rejected: {problems}\n"
+                    "Return the entire source chunk again. Preserve every character in its original order, "
+                    "apart from outer dialogue quotation marks and layout whitespace."
+                )
+                print("Retrying chunk because validation failed...")
+                continue
+            return []
 
         # If repair failed, show warning
         print(f"Warning: Could not parse chunk {chunk_num} response as JSON (attempt {attempt + 1})")
@@ -345,21 +423,41 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
         # Last resort: extract individual valid entries with regex
         salvaged_entries = salvage_json_entries(json_text)
         if salvaged_entries:
+            salvaged_entries, normalized_count = normalize_unsafe_speakers(
+                salvaged_entries, first_person_speaker
+            )
+            if normalized_count:
+                print(f"  Normalized {normalized_count} unsafe speaker label(s) to {first_person_speaker!r}")
+            schema_errors = validate_script_entries(salvaged_entries)
+            fidelity = compare_text_fidelity(chunk, salvaged_entries)
+            if schema_errors or not fidelity.exact:
+                print("Regex-salvaged entries failed schema or text-fidelity validation")
+                continue
             print(f"Regex-salvaged {len(salvaged_entries)} entries from malformed response")
             return salvaged_entries
 
     return []
 
-def _write_script_output(all_entries):
+def _write_script_output(all_entries, output_path=None):
     """Write annotated_script.json and clear stale chunks.json."""
-    output_path = os.path.join("..", "annotated_script.json")
+    if output_path is None:
+        output_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "annotated_script.json")
+        )
+    else:
+        output_path = os.path.abspath(output_path)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(all_entries, f, indent=2, ensure_ascii=False)
 
-    chunks_path = os.path.join("..", "chunks.json")
-    if os.path.exists(chunks_path):
-        os.remove(chunks_path)
-        print("Cleared old chunks.json")
+    default_output = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "annotated_script.json")
+    )
+    if output_path == default_output:
+        chunks_path = os.path.join(os.path.dirname(__file__), "..", "chunks.json")
+        if os.path.exists(chunks_path):
+            os.remove(chunks_path)
+            print("Cleared old chunks.json")
 
     speakers = set(entry.get("speaker") or entry.get("type") or "UNKNOWN" for entry in all_entries)
     print(f"\nGenerated {len(all_entries)} script entries")
@@ -367,7 +465,7 @@ def _write_script_output(all_entries):
     print(f"Output saved to: {output_path}")
 
 
-def run_single_speaker(book_content, speaker_name, instruct):
+def run_single_speaker(book_content, speaker_name, instruct, output_path=None):
     """Bypass the LLM and emit one entry per text segment, all attributed
     to a single speaker. Used for first-person memoirs, non-fiction, etc.,
     where character detection is unnecessary."""
@@ -383,7 +481,7 @@ def run_single_speaker(book_content, speaker_name, instruct):
         print("Error: No script entries generated (input text is empty?)")
         sys.exit(1)
 
-    _write_script_output(entries)
+    _write_script_output(entries, output_path=output_path)
 
 
 def main():
@@ -395,6 +493,12 @@ def main():
                         help="Speaker name used in single-speaker mode (default: Narrator).")
     parser.add_argument("--instruct", default="Neutral narration.",
                         help="Voice direction used in single-speaker mode.")
+    parser.add_argument("--first-person-speaker",
+                        help="Canonical identity for a sustained first-person narrator.")
+    parser.add_argument("--no-first-person-speaker", action="store_true",
+                        help="Ignore any first-person speaker configured in app/config.json.")
+    parser.add_argument("--output",
+                        help="Write script to this path instead of repository annotated_script.json.")
     args = parser.parse_args()
 
     input_file_path = args.input_file_path
@@ -414,7 +518,7 @@ def main():
 
     if args.single_speaker:
         print(f"Single-speaker mode: attributing all narration to '{args.speaker_name}'")
-        run_single_speaker(book_content, args.speaker_name, args.instruct)
+        run_single_speaker(book_content, args.speaker_name, args.instruct, output_path=args.output)
         return
 
     # Load LLM config
@@ -449,12 +553,19 @@ def main():
     min_p = generation_config.get("min_p", 0)
     presence_penalty = generation_config.get("presence_penalty", 0.0)
     banned_tokens = generation_config.get("banned_tokens", [])
+    first_person_speaker = (
+        None if args.no_first_person_speaker
+        else args.first_person_speaker or generation_config.get("first_person_speaker")
+    )
+    lossless_fallback = generation_config.get("lossless_fallback", bool(first_person_speaker))
 
     print(f"Connecting to: {base_url}")
     print(f"Using model: {model_name}")
     print(f"Chunk size: {chunk_size} chars, Max tokens: {max_tokens}")
     if banned_tokens:
         print(f"Banned tokens: {banned_tokens}")
+    if first_person_speaker:
+        print(f"First-person narrator identity: {first_person_speaker}")
 
     # Create OpenAI client with custom base URL
     client = OpenAI(
@@ -469,6 +580,7 @@ def main():
     print(f"Split into {total_chunks} chunks at paragraph/sentence boundaries")
 
     all_entries = []
+    failed_chunks = []
     for i, chunk in enumerate(chunks, 1):
         print(f"Processing chunk {i}/{total_chunks} ({len(chunk)} chars)...")
 
@@ -484,16 +596,42 @@ def main():
             top_k=top_k,
             min_p=min_p,
             presence_penalty=presence_penalty,
-            banned_tokens=banned_tokens
+            banned_tokens=banned_tokens,
+            first_person_speaker=first_person_speaker
         )
+        if not entries and lossless_fallback:
+            fallback_speaker = first_person_speaker or "NARRATOR"
+            entries = build_lossless_fallback_entries(chunk, fallback_speaker)
+            fallback_fidelity = compare_text_fidelity(chunk, entries)
+            if not fallback_fidelity.exact:
+                entries = []
+            else:
+                print(
+                    f"  LLM validation failed; using {len(entries)} lossless "
+                    f"fallback entries as {fallback_speaker}"
+                )
+        if not entries:
+            failed_chunks.append(i)
         all_entries.extend(entries)
         print(f"  Got {len(entries)} entries")
 
-    if not all_entries:
-        print("Error: No script entries generated")
+    if failed_chunks:
+        failed_list = ", ".join(str(number) for number in failed_chunks)
+        print(f"Error: {len(failed_chunks)} chunk(s) failed validation: {failed_list}")
+        print("Existing annotated_script.json was not changed.")
         sys.exit(1)
 
-    _write_script_output(all_entries)
+    schema_errors = validate_script_entries(all_entries)
+    fidelity = compare_text_fidelity(book_content, all_entries)
+    if schema_errors or not fidelity.exact:
+        if schema_errors:
+            print(f"Error: Invalid generated script: {'; '.join(schema_errors[:5])}")
+        if not fidelity.exact:
+            print(f"Error: Full-book text fidelity failed: {format_fidelity_error(fidelity)}")
+        print("Existing annotated_script.json was not changed.")
+        sys.exit(1)
+
+    _write_script_output(all_entries, output_path=args.output)
 
 
 if __name__ == '__main__':

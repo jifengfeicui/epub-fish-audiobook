@@ -771,7 +771,11 @@ async def review_script(background_tasks: BackgroundTasks):
     if process_state["review"]["running"]:
         raise HTTPException(status_code=400, detail="Script review already running")
 
-    background_tasks.add_task(run_process, [sys.executable, "-u", "review_script.py"], "review")
+    cmd = [sys.executable, "-u", "review_script.py"]
+    input_file = state.get("input_file_path")
+    if input_file:
+        cmd.extend(["--source", input_file])
+    background_tasks.add_task(run_process, cmd, "review")
     return {"status": "started"}
 
 @app.post("/api/review_script_contextual")
@@ -800,11 +804,11 @@ async def review_script_contextual(request: ContextualReviewRequest, background_
             review_batch_size = 25
 
     estimated_calls = ceil(total_entries / review_batch_size) if total_entries else 0
-    background_tasks.add_task(
-        run_process,
-        [sys.executable, "-u", "review_script.py", "--context-window", str(window_size)],
-        "review"
-    )
+    cmd = [sys.executable, "-u", "review_script.py", "--context-window", str(window_size)]
+    input_file = state.get("input_file_path")
+    if input_file:
+        cmd.extend(["--source", input_file])
+    background_tasks.add_task(run_process, cmd, "review")
     return {
         "status": "started",
         "mode": "contextual",

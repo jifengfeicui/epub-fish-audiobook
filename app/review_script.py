@@ -6,6 +6,13 @@ import argparse
 from openai import OpenAI
 from review_prompts import REVIEW_SYSTEM_PROMPT, REVIEW_USER_PROMPT
 from generate_script import clean_json_string, repair_json_array, salvage_json_entries
+from script_validation import (
+    combined_script_text,
+    compare_text_fidelity,
+    format_fidelity_error,
+    normalize_unsafe_speakers,
+    validate_script_entries,
+)
 
 
 def _is_section_break(text):
@@ -193,33 +200,13 @@ def normalize_text(text):
 
 
 def check_text_loss(original_entries, corrected_entries, threshold=0.95, upper_bound=None):
-    """Check if corrected entries lost or gained significant text.
-
-    Returns (passed, original_text, corrected_text, ratio).
-    passed is True if the corrected word count ratio falls within
-    [threshold, upper_bound]. If upper_bound is None, it defaults to
-    1.0 + (1.0 - threshold), i.e. symmetric around 1.0.
-    """
-    orig_words = []
-    for e in original_entries:
-        orig_words.extend(normalize_text(e.get("text", "")).split())
-
-    corr_words = []
-    for e in corrected_entries:
-        corr_words.extend(normalize_text(e.get("text", "")).split())
-
-    if not orig_words:
-        return True, "", "", 1.0
-
-    orig_joined = " ".join(orig_words)
-    corr_joined = " ".join(corr_words)
-
-    ratio = len(corr_words) / len(orig_words) if orig_words else 1.0
-
-    if upper_bound is None:
-        upper_bound = 1.0 + (1.0 - threshold)
-    passed = threshold <= ratio <= upper_bound
-    return passed, orig_joined, corr_joined, ratio
+    """Check exact normalized character preservation between review versions."""
+    del threshold, upper_bound
+    original_text = combined_script_text(original_entries)
+    corrected_text = combined_script_text(corrected_entries)
+    result = compare_text_fidelity(original_text, corrected_entries)
+    ratio = result.script_length / result.source_length if result.source_length else 1.0
+    return result.exact, original_text, corrected_text, ratio
 
 
 def diff_entries(original, corrected):
@@ -249,15 +236,25 @@ def diff_entries(original, corrected):
 
 def main():
     parser = argparse.ArgumentParser(description="Review and fix annotated audiobook script")
-    parser.add_argument("--source", help="Path to original source text for comparison (mode 2, not yet implemented)")
+    parser.add_argument("--script", help="Path to the generated script to review")
+    parser.add_argument("--output", help="Write the reviewed script to this path")
+    parser.add_argument("--source", help="Path to original source text for final fidelity validation")
     parser.add_argument("--context-window", type=int, default=0,
                         help="If > 0, review each entry with +/- N neighboring entries for better segmentation and speaker fixes")
+    parser.add_argument("--first-person-speaker",
+                        help="Canonical identity for a sustained first-person narrator")
+    parser.add_argument("--no-first-person-speaker", action="store_true",
+                        help="Ignore any first-person speaker configured in app/config.json")
     args = parser.parse_args()
 
     # Locate annotated_script.json
-    script_path = os.path.join(os.path.dirname(__file__), "..", "annotated_script.json")
+    default_script_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "annotated_script.json")
+    )
+    script_path = os.path.abspath(args.script) if args.script else default_script_path
+    output_path = os.path.abspath(args.output) if args.output else script_path
     if not os.path.exists(script_path):
-        print("Error: annotated_script.json not found. Generate a script first.")
+        print(f"Error: Script not found: {script_path}. Generate a script first.")
         sys.exit(1)
 
     with open(script_path, "r", encoding="utf-8") as f:
@@ -306,12 +303,18 @@ def main():
     min_p = generation_config.get("min_p", 0)
     presence_penalty = generation_config.get("presence_penalty", 0.0)
     banned_tokens = generation_config.get("banned_tokens", [])
+    first_person_speaker = (
+        None if args.no_first_person_speaker
+        else args.first_person_speaker or generation_config.get("first_person_speaker")
+    )
 
     print(f"Connecting to: {base_url}")
     print(f"Using model: {model_name}")
     print(f"Batch size: {batch_size} entries, Max tokens: {max_tokens}")
     if banned_tokens:
         print(f"Banned tokens: {banned_tokens}")
+    if first_person_speaker:
+        print(f"First-person narrator identity: {first_person_speaker}")
 
     client = OpenAI(base_url=base_url, api_key=api_key)
 
@@ -373,10 +376,17 @@ def main():
                 previous_tail = batch[-2:] if len(batch) >= 2 else batch
                 continue
 
-            passed, orig_text, corr_text, ratio = check_text_loss(batch, corrected, threshold=0.95, upper_bound=1.15)
-            if not passed:
-                print(f"  WARNING: Text length mismatch (loss or gain)! Word ratio: {ratio:.2f} (acceptable range: 0.95-1.15)")
-                print(f"  Original words: {len(orig_text.split())}, Corrected words: {len(corr_text.split())}")
+            corrected, normalized_count = normalize_unsafe_speakers(
+                corrected, first_person_speaker
+            )
+            if normalized_count:
+                print(f"  Normalized {normalized_count} unsafe speaker label(s) to {first_person_speaker!r}")
+            schema_errors = validate_script_entries(corrected)
+            passed, orig_text, corr_text, ratio = check_text_loss(batch, corrected)
+            if schema_errors or not passed:
+                if schema_errors:
+                    print(f"  WARNING: Invalid reviewed entries: {'; '.join(schema_errors[:3])}")
+                print(f"  WARNING: Text changed or was lost (normalized character ratio: {ratio:.3f}).")
                 print(f"  Keeping original entries for batch {batch_index} to prevent data corruption.")
                 all_corrected.extend(batch)
                 total_stats["batches_failed"] += 1
@@ -446,10 +456,17 @@ def main():
                 continue
 
             # Text-loss safety check
+            corrected, normalized_count = normalize_unsafe_speakers(
+                corrected, first_person_speaker
+            )
+            if normalized_count:
+                print(f"  Normalized {normalized_count} unsafe speaker label(s) to {first_person_speaker!r}")
+            schema_errors = validate_script_entries(corrected)
             passed, orig_text, corr_text, ratio = check_text_loss(batch, corrected)
-            if not passed:
-                print(f"  WARNING: Text length mismatch (loss or gain)! Word ratio: {ratio:.2f} (acceptable range: 0.95-1.05)")
-                print(f"  Original words: {len(orig_text.split())}, Corrected words: {len(corr_text.split())}")
+            if schema_errors or not passed:
+                if schema_errors:
+                    print(f"  WARNING: Invalid reviewed entries: {'; '.join(schema_errors[:3])}")
+                print(f"  WARNING: Text changed or was lost (normalized character ratio: {ratio:.3f}).")
                 print(f"  Keeping original entries for batch {i} to prevent data corruption.")
                 all_corrected.extend(batch)
                 total_stats["batches_failed"] += 1
@@ -496,13 +513,28 @@ def main():
     else:
         print("\nNarrator merging: disabled (enable in Setup > Advanced)")
 
+    final_errors = validate_script_entries(all_corrected)
+    if final_errors:
+        print(f"Error: Review produced an invalid script: {'; '.join(final_errors[:5])}")
+        print(f"Existing output was not changed: {output_path}")
+        sys.exit(1)
+
+    if source_text is not None:
+        source_fidelity = compare_text_fidelity(source_text, all_corrected)
+        if not source_fidelity.exact:
+            print(f"Error: Reviewed script does not cover the source: {format_fidelity_error(source_fidelity)}")
+            print(f"Existing output was not changed: {output_path}")
+            sys.exit(1)
+        print("Source fidelity: exact normalized character match")
+
     # Write corrected script
-    with open(script_path, "w", encoding="utf-8") as f:
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(all_corrected, f, indent=2, ensure_ascii=False)
 
     # Delete chunks.json so editor regenerates
     chunks_path = os.path.join(os.path.dirname(__file__), "..", "chunks.json")
-    if os.path.exists(chunks_path):
+    if output_path == default_script_path and os.path.exists(chunks_path):
         os.remove(chunks_path)
         print("Cleared old chunks.json")
 
@@ -529,7 +561,7 @@ def main():
     else:
         print(f"Fixed {total_changes} issues across {total_batches} batches.")
 
-    print(f"Output saved to: {script_path}")
+    print(f"Output saved to: {output_path}")
     print("Task review completed successfully.")
 
 

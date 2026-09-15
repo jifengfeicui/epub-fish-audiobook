@@ -23,6 +23,10 @@ m4b_cover.jpg
 temp_m4b_combined.wav
 temp_m4b_meta.txt
 voicelines/
+fish_adapter/output/
+fish_adapter/config.local.json
+fish_adapter/voices.json
+fish_adapter/voice_pool.json
 scripts/
 app/config.json
 app/output_audio_cloned/
@@ -34,6 +38,8 @@ app/output_audio/
 /SPEC.md
 
 audiobook.mp3
+/books/
+/annotated_script_generated_raw.json
 
 # Generated runtime files
 chunks.json
