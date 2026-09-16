@@ -26,6 +26,7 @@ class Project(Base):
     status: Mapped[str] = mapped_column(String(32), default="ready", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    archived_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
     settings: Mapped["ProjectSettings"] = relationship(back_populates="project", cascade="all, delete-orphan", uselist=False)
     chapters: Mapped[list["Chapter"]] = relationship(back_populates="project", cascade="all, delete-orphan", order_by="Chapter.position")
@@ -105,6 +106,8 @@ class VoiceProfile(Base):
     name: Mapped[str] = mapped_column(String(300))
     bound_speaker: Mapped[Optional[str]] = mapped_column(String(200), nullable=True, unique=True)
     pool_order: Mapped[int] = mapped_column(Integer, default=0)
+    gender: Mapped[str] = mapped_column(String(100), default="")
+    traits: Mapped[str] = mapped_column(Text, default="")
 
 
 class SpeakerAssignment(Base):
@@ -114,7 +117,13 @@ class SpeakerAssignment(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
     speaker: Mapped[str] = mapped_column(String(200))
-    voice_profile_id: Mapped[str] = mapped_column(ForeignKey("voice_profiles.id"))
+    voice_profile_id: Mapped[Optional[str]] = mapped_column(ForeignKey("voice_profiles.id"), nullable=True)
+    gender: Mapped[str] = mapped_column(String(100), default="")
+    personality: Mapped[str] = mapped_column(Text, default="")
+    line_count: Mapped[int] = mapped_column(Integer, default=0)
+    importance: Mapped[int] = mapped_column(Integer, default=0)
+    first_seen: Mapped[int] = mapped_column(Integer, default=0)
+    user_edited: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

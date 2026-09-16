@@ -162,6 +162,65 @@ def inspect_epub(epub_path: Path) -> list[dict[str, Any]]:
     return chapters
 
 
+_TXT_CHAPTER = re.compile(
+    r"^(?:第\s*[0-9〇零一二三四五六七八九十百千万兩两]+\s*[章节節回卷部篇](?:.*)?|chapter\s+(?:\d+|[ivxlcdm]+)(?:[\s:.-].*)?)$",
+    re.IGNORECASE,
+)
+
+
+def inspect_txt(txt_path: Path) -> list[dict[str, Any]]:
+    """Split a UTF-8 or GB18030 text file on conventional chapter headings."""
+    raw = txt_path.read_bytes()
+    text = None
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            text = raw.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            pass
+    if text is None:
+        raise ValueError("TXT must be encoded as UTF-8 or GB18030")
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return []
+
+    sections: list[tuple[str, list[str]]] = []
+    title = ""
+    lines: list[str] = []
+    for line in text.splitlines():
+        heading = line.strip()
+        if heading and _TXT_CHAPTER.fullmatch(heading):
+            if any(item.strip() for item in lines):
+                sections.append((title, lines))
+            title, lines = heading, [heading]
+        else:
+            lines.append(line)
+    if any(item.strip() for item in lines):
+        sections.append((title, lines))
+    if not sections:
+        sections = [("", text.splitlines())]
+
+    chapters = []
+    for index, (heading, body) in enumerate(sections, start=1):
+        chapter_text = "\n".join(body).strip() + "\n"
+        chapters.append({
+            "index": index,
+            "id": f"txt-{index}",
+            "href": f"txt:{index}",
+            "title": _safe_title(heading, f"第{index}章"),
+            "text": chapter_text,
+        })
+    return chapters
+
+
+def inspect_book(path: Path) -> list[dict[str, Any]]:
+    if path.suffix.lower() == ".epub":
+        return inspect_epub(path)
+    if path.suffix.lower() == ".txt":
+        return inspect_txt(path)
+    raise ValueError("Only EPUB and TXT files are supported")
+
+
 def _atomic_json(data: Any, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))

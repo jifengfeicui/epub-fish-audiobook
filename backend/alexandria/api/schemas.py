@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field, field_validator
 
 
 RenderStartMode = Literal["after_review_batch", "after_all_reviews"]
+JobType = Literal["preprocess", "render"]
 
 
 class ProjectUpdate(BaseModel):
@@ -19,7 +20,7 @@ class ProjectUpdate(BaseModel):
     single_speaker: Optional[bool] = None
     speaker_name: Optional[str] = Field(default=None, min_length=1, max_length=200)
     instruct: Optional[str] = Field(default=None, max_length=1000)
-    workers: Optional[int] = Field(default=None, ge=1, le=16)
+    archived: Optional[bool] = None
 
 
 class ScriptEntryInput(BaseModel):
@@ -48,6 +49,10 @@ class ScriptUpdate(BaseModel):
     entries: list[ScriptEntryInput] = Field(min_length=1)
 
 
+class JobCreate(BaseModel):
+    type: JobType
+
+
 class SettingsUpdate(BaseModel):
     llm_base_url: Optional[str] = None
     llm_api_key: Optional[str] = None
@@ -58,6 +63,7 @@ class SettingsUpdate(BaseModel):
     generation: Optional[dict[str, Any]] = None
     prompts: Optional[dict[str, str]] = None
     fish_tts: Optional[dict[str, Any]] = None
+    fish_workers: Optional[int] = Field(default=None, ge=1, le=16)
 
 
 class VoiceInput(BaseModel):
@@ -66,7 +72,20 @@ class VoiceInput(BaseModel):
     name: str = Field(min_length=1, max_length=300)
     bound_speaker: Optional[str] = Field(default=None, max_length=200)
     pool_order: int = Field(default=0, ge=0)
+    gender: str = Field(default="", max_length=100)
+    traits: str = Field(default="", max_length=1000)
 
 
 class VoiceListUpdate(BaseModel):
     voices: list[VoiceInput]
+
+
+class CharacterInput(BaseModel):
+    speaker: str = Field(min_length=1, max_length=200)
+    gender: str = Field(default="", max_length=100)
+    personality: str = Field(default="", max_length=1000)
+    voice_profile_id: Optional[str] = Field(default=None, max_length=36)
+
+
+class CharacterListUpdate(BaseModel):
+    characters: list[CharacterInput]

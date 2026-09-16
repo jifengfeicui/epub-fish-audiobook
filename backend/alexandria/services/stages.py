@@ -4,9 +4,11 @@ import copy
 import hashlib
 import json
 import os
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
@@ -15,6 +17,10 @@ from backend.alexandria.db.repository import Repository
 
 
 LogCallback = Callable[[str], None]
+
+
+class StageCancelled(RuntimeError):
+    pass
 
 
 def _slug(value: str) -> str:
@@ -31,10 +37,11 @@ class StageExecutor:
         self.repo = repository
         self.root = root.resolve()
 
-    def _run(self, command: list[str], log: LogCallback) -> None:
+    def _run(self, command: list[str], log: LogCallback, should_stop: Callable[[], bool] = lambda: False) -> None:
         process = subprocess.Popen(
             command,
             cwd=self.root,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -42,19 +49,49 @@ class StageExecutor:
             errors="replace",
         )
         assert process.stdout is not None
-        for line in process.stdout:
+        lines: queue.Queue[str | None] = queue.Queue()
+
+        def read_output() -> None:
+            for line in process.stdout:
+                lines.put(line)
+            lines.put(None)
+
+        reader = threading.Thread(target=read_output, daemon=True)
+        reader.start()
+        output: list[str] = []
+        while True:
+            if should_stop():
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                reader.join(timeout=1)
+                process.stdout.close()
+                raise StageCancelled("Stage cancelled")
+            try:
+                line = lines.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if line is None:
+                break
             line = line.strip()
             if line:
+                output.append(line)
                 log(line)
         code = process.wait()
+        reader.join(timeout=1)
+        process.stdout.close()
         if code:
-            raise RuntimeError(f"Stage process failed with exit code {code}")
+            detail = next((line for line in reversed(output) if "Error" in line), output[-1] if output else "")
+            raise RuntimeError(detail or f"Stage process failed with exit code {code}")
 
     def _config(self) -> dict[str, Any]:
         settings = self.repo.get_settings(reveal_secrets=True)
         return {
             "llm": {
-                "base_url": settings.get("llm_base_url", "http://localhost:11434/v1"),
+                "base_url": settings.get("llm_base_url", "http://localhost:1234/v1"),
                 "api_key": settings.get("llm_api_key", "local"),
                 "model_name": settings.get("llm_model", "local-model"),
             },
@@ -90,6 +127,7 @@ class StageExecutor:
                 "user_prompt": app_config["prompts"].get("user_prompt"),
             },
             "generate_script": self._file_hash(self.root / "app" / "generate_script.py"),
+            "script_validation": self._file_hash(self.root / "app" / "script_validation.py"),
             "default_prompts": self._file_hash(self.root / "default_prompts.txt"),
         })
 
@@ -109,10 +147,11 @@ class StageExecutor:
                 "review_user_prompt": app_config["prompts"].get("review_user_prompt"),
             },
             "review_script": self._file_hash(self.root / "app" / "review_script.py"),
+            "script_validation": self._file_hash(self.root / "app" / "script_validation.py"),
             "default_prompts": self._file_hash(self.root / "review_prompts.txt"),
         })
 
-    def generate(self, chapter_id: int, project: dict[str, Any], log: LogCallback) -> dict[str, Any]:
+    def generate(self, chapter_id: int, project: dict[str, Any], log: LogCallback, should_stop: Callable[[], bool] = lambda: False) -> dict[str, Any]:
         chapter = self.repo.get_chapter_record(chapter_id)
         project_dir = self.repo.storage_root / "projects" / project["id"]
         work_root = project_dir / "work"
@@ -147,11 +186,11 @@ class StageExecutor:
                 command += ["--first-person-speaker", settings["first_person_speaker"]]
             else:
                 command += ["--no-first-person-speaker"]
-            self._run(command, log)
+            self._run(command, log, should_stop)
             entries = json.loads(output.read_text(encoding="utf-8"))
         return self.repo.save_revision(chapter_id, "generated", entries, self.generate_input_hash(chapter_id, project))
 
-    def review(self, chapter_id: int, project: dict[str, Any], generated: dict[str, Any], log: LogCallback) -> dict[str, Any]:
+    def review(self, chapter_id: int, project: dict[str, Any], generated: dict[str, Any], log: LogCallback, should_stop: Callable[[], bool] = lambda: False) -> dict[str, Any]:
         chapter = self.repo.get_chapter_record(chapter_id)
         project_dir = self.repo.storage_root / "projects" / project["id"]
         work_root = project_dir / "work"
@@ -185,9 +224,79 @@ class StageExecutor:
                 command += ["--first-person-speaker", settings["first_person_speaker"]]
             else:
                 command += ["--no-first-person-speaker"]
-            self._run(command, log)
+            self._run(command, log, should_stop)
             entries = json.loads(output.read_text(encoding="utf-8"))
         return self.repo.save_revision(chapter_id, "reviewed", entries, self.review_input_hash(generated, project))
+
+    def analyze_characters(self, project: dict[str, Any]) -> list[dict[str, Any]]:
+        from openai import OpenAI
+
+        characters = self.repo.refresh_characters(project["id"])
+        pending = [row for row in characters if not row["user_edited"] and (not row["gender"] or not row["personality"])]
+        if not pending:
+            return characters
+        samples = self.repo.character_samples(project["id"], [row["speaker"] for row in pending])
+        settings = self.repo.get_settings(reveal_secrets=True)
+        client = OpenAI(
+            base_url=settings.get("llm_base_url", "http://localhost:1234/v1"),
+            api_key=settings.get("llm_api_key", "local"),
+            timeout=60,
+        )
+        payload = [{"speaker": row["speaker"], "lines": samples[row["speaker"]]} for row in pending]
+        def metadata_item(speaker: str) -> dict[str, Any]:
+            return {
+                "type": "object",
+                "properties": {
+                    "speaker": {"const": speaker},
+                    "gender": {"type": "string", "minLength": 1},
+                    "personality": {"type": "string", "minLength": 1},
+                },
+                "required": ["speaker", "gender", "personality"],
+                "additionalProperties": False,
+            }
+        response = client.chat.completions.create(
+            model=settings.get("llm_model", "local-model"),
+            messages=[
+                {"role": "system", "content": "Return only a JSON array. Infer audiobook character metadata from quoted lines. Use 未知 when gender cannot be inferred."},
+                {"role": "user", "content": "For every character return speaker, gender, and one concise Chinese personality sentence. Keep speaker exact; do not omit or add characters.\n" + json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.2,
+            max_tokens=4096,
+            reasoning_effort="none",
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "character_metadata",
+                    "strict": True,
+                    "schema": {
+                        "type": "array",
+                        "prefixItems": [metadata_item(row["speaker"]) for row in pending],
+                        "minItems": len(pending),
+                        "maxItems": len(pending),
+                    },
+                },
+            },
+        )
+        text = (response.choices[0].message.content or "").strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        parsed = json.loads(text)
+        if not isinstance(parsed, list):
+            raise ValueError("Character analysis did not return a JSON array")
+        allowed = [row["speaker"] for row in pending]
+        if any(not isinstance(row, dict) for row in parsed):
+            raise ValueError("Character analysis contains a non-object entry")
+        speakers = [row.get("speaker") for row in parsed]
+        if len(speakers) != len(set(speakers)) or set(speakers) != set(allowed):
+            raise ValueError("Character analysis must return every requested speaker exactly once")
+        updates = []
+        for row in parsed:
+            gender = row.get("gender")
+            personality = row.get("personality")
+            if not isinstance(gender, str) or not gender.strip() or not isinstance(personality, str) or not personality.strip():
+                raise ValueError(f"Character analysis is incomplete for {row.get('speaker', '')}")
+            updates.append({"speaker": row["speaker"], "gender": gender, "personality": personality})
+        return self.repo.update_characters(project["id"], updates, automated=True)
 
     def render(self, chapter_id: int, project: dict[str, Any], log: LogCallback) -> Path:
         from fish_adapter.cache import fingerprint_entry
@@ -210,7 +319,7 @@ class StageExecutor:
         config["api"]["base_url"] = settings.get("fish_base_url", config["api"]["base_url"])
         config["api"]["model"] = settings.get("fish_model", config["api"]["model"])
         config["tts"].update(settings.get("fish_tts", {}))
-        config["render"]["workers"] = project["settings"].get("workers", 2)
+        config["render"]["workers"] = settings.get("fish_workers", 5)
         audio_dir = self.repo.storage_root / "projects" / project["id"] / "audio" / f"{chapter.position:04d}"
         audio_dir.mkdir(parents=True, exist_ok=True)
         renderer = FishRenderer(config, api_key)
@@ -255,7 +364,7 @@ class StageExecutor:
             return position, output, fingerprint, result.attempts
 
         files: dict[int, Path] = {}
-        workers = max(1, min(int(project["settings"].get("workers", 2)), 16))
+        workers = max(1, min(int(settings.get("fish_workers", 5)), 16))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(synthesize, entry) for entry in script["entries"]]
             for future in as_completed(futures):

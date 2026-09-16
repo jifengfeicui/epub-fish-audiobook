@@ -8,7 +8,7 @@ import aiofiles
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 
-from backend.alexandria.api.schemas import ProjectUpdate, ScriptUpdate, SettingsUpdate, VoiceListUpdate
+from backend.alexandria.api.schemas import CharacterListUpdate, JobCreate, ProjectUpdate, ScriptUpdate, SettingsUpdate, VoiceListUpdate
 from backend.alexandria.db.repository import Repository
 from backend.alexandria.domain.pipeline import RENDER_START_MODES
 
@@ -33,6 +33,7 @@ def _http_error(exc: Exception) -> HTTPException:
         "not_resumable": (409, "The job cannot be resumed"),
         "invalid_chapter_range": (422, "The selected chapter range is invalid"),
         "voice_in_use": (409, "This voice is assigned to a project and cannot be removed"),
+        "render_not_ready": (409, "All selected chapters must finish preprocessing before TTS can start"),
     }
     status, detail = mapping.get(str(exc), (400, str(exc)))
     return HTTPException(status_code=status, detail=detail)
@@ -44,8 +45,8 @@ def health():
 
 
 @router.get("/projects")
-def list_projects(request: Request):
-    return _repo(request).list_projects()
+def list_projects(request: Request, archived: bool = False):
+    return _repo(request).list_projects(archived=archived)
 
 
 @router.post("/projects", status_code=201)
@@ -63,8 +64,8 @@ async def create_project(
     if not 1 <= release_batch_size <= 20:
         raise HTTPException(status_code=422, detail="Release batch size must be between 1 and 20")
     filename = Path(file.filename or "book.epub").name
-    if Path(filename).suffix.lower() != ".epub":
-        raise HTTPException(status_code=422, detail="Only EPUB files are supported")
+    if Path(filename).suffix.lower() not in (".epub", ".txt"):
+        raise HTTPException(status_code=422, detail="Only EPUB and TXT files are supported")
     project_id = str(uuid.uuid4())
     repository = _repo(request)
     source_dir = repository.storage_root / "projects" / project_id / "source"
@@ -76,11 +77,11 @@ async def create_project(
             while block := await file.read(1024 * 1024):
                 digest.update(block)
                 await output.write(block)
-        from tools.render_book import inspect_epub
+        from tools.render_book import inspect_book
 
-        chapters = inspect_epub(source_path)
+        chapters = inspect_book(source_path)
         if not chapters:
-            raise ValueError("No readable chapters found in EPUB")
+            raise ValueError("No readable chapters found")
         last_chapter = len(chapters)
         if (from_chapter is not None and from_chapter < 1) or (to_chapter is not None and to_chapter < 1):
             raise HTTPException(status_code=422, detail="Chapter range values must be positive")
@@ -109,7 +110,7 @@ async def create_project(
         raise
     except Exception as exc:
         source_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail=f"Could not import EPUB: {exc}") from exc
+        raise HTTPException(status_code=400, detail=f"Could not import book: {exc}") from exc
 
 
 @router.get("/projects/{project_id}")
@@ -124,6 +125,22 @@ def get_project(project_id: str, request: Request):
 def update_project(project_id: str, payload: ProjectUpdate, request: Request):
     try:
         return _repo(request).update_project(project_id, payload.model_dump(exclude_unset=True))
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.delete("/projects/{project_id}", status_code=204)
+def delete_project(project_id: str, request: Request):
+    try:
+        _repo(request).delete_project(project_id)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/projects/{project_id}/reparse")
+def reparse_project(project_id: str, request: Request):
+    try:
+        return _repo(request).reparse_project(project_id)
     except Exception as exc:
         raise _http_error(exc) from exc
 
@@ -158,9 +175,9 @@ def update_script(chapter_id: int, payload: ScriptUpdate, request: Request):
 
 
 @router.post("/projects/{project_id}/jobs", status_code=201)
-def create_job(project_id: str, request: Request):
+def create_job(project_id: str, payload: JobCreate, request: Request):
     try:
-        return _repo(request).create_job(project_id)
+        return _repo(request).create_job(project_id, payload.type)
     except Exception as exc:
         raise _http_error(exc) from exc
 
@@ -213,6 +230,26 @@ def list_speaker_assignments(project_id: str, request: Request):
     try:
         _repo(request).get_project(project_id)
         return _repo(request).list_speaker_assignments(project_id)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/projects/{project_id}/characters")
+def list_characters(project_id: str, request: Request):
+    try:
+        _repo(request).get_project(project_id)
+        return _repo(request).refresh_characters(project_id)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.put("/projects/{project_id}/characters")
+def update_characters(project_id: str, payload: CharacterListUpdate, request: Request):
+    try:
+        return _repo(request).update_characters(
+            project_id,
+            [character.model_dump() for character in payload.characters],
+        )
     except Exception as exc:
         raise _http_error(exc) from exc
 

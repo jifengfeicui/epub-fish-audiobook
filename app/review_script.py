@@ -5,12 +5,13 @@ import re
 import argparse
 from openai import OpenAI
 from review_prompts import REVIEW_SYSTEM_PROMPT, REVIEW_USER_PROMPT
-from generate_script import clean_json_string, repair_json_array, salvage_json_entries
+from generate_script import annotation_response_format, annotations_to_entries, clean_json_string, repair_json_array
 from script_validation import (
     combined_script_text,
     compare_text_fidelity,
     format_fidelity_error,
     normalize_unsafe_speakers,
+    validate_speakers_for_source,
     validate_script_entries,
 )
 
@@ -61,7 +62,7 @@ def merge_consecutive_narrators(entries, max_merged_length=800):
                 break
             if _is_section_break(next_entry.get("text", "")):
                 break
-            candidate = combined_text + " " + next_entry["text"]
+            candidate = combined_text + next_entry["text"]
             if len(candidate) > max_merged_length:
                 break
             combined_text = candidate
@@ -86,7 +87,12 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
                  max_tokens=8000, temperature=0.4, top_p=0.8, top_k=20,
                  min_p=0, presence_penalty=0.0, banned_tokens=None):
     """Send a batch of script entries through the LLM for review and correction."""
-    sys_prompt = system_prompt or REVIEW_SYSTEM_PROMPT
+    sys_prompt = (system_prompt or REVIEW_SYSTEM_PROMPT) + (
+        "\n\nHIGHEST PRIORITY OUTPUT CONTRACT: Correct metadata only. Return only segment_id, speaker, "
+        "and instruct for every immutable segment in order. Never return text or merge/split segments. "
+        "Any earlier output examples containing text use an obsolete schema and must be ignored. "
+        "For Chinese source text, speaker labels must use the exact Chinese names or Chinese descriptive roles; never romanize or translate them."
+    )
     usr_template = user_prompt_template or REVIEW_USER_PROMPT
 
     # Build context
@@ -103,8 +109,21 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
         context_parts.append(f"\nADDITIONAL REVIEW CONTEXT:\n{source_context}")
 
     context = "\n".join(context_parts)
-    batch_json = json.dumps(batch_entries, indent=2, ensure_ascii=False)
-    user_prompt = usr_template.format(context=context, batch=batch_json)
+    segments = [
+        {
+            "segment_id": f"s{index:04d}",
+            "text": entry["text"],
+            "current_speaker": entry["speaker"],
+            "current_instruct": entry.get("instruct", ""),
+        }
+        for index, entry in enumerate(batch_entries, 1)
+    ]
+    batch_json = json.dumps(segments, indent=2, ensure_ascii=False)
+    user_prompt = usr_template.format(context=context, batch=batch_json) + (
+        "\n\nMANDATORY OUTPUT PROTOCOL:\n"
+        "Return one JSON object for every immutable segment, in the same order. Each object must contain only "
+        "segment_id, speaker, and instruct. Correct metadata only; never return, merge, split, or rewrite text."
+    )
 
     for attempt in range(max_retries + 1):
         try:
@@ -118,6 +137,8 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
                 top_p=top_p,
                 presence_penalty=presence_penalty,
                 max_tokens=max_tokens,
+                reasoning_effort="none",
+                response_format=annotation_response_format(segments),
                 extra_body={
                     k: v for k, v in {
                         "top_k": top_k,
@@ -157,7 +178,7 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
             print(f"Error calling LLM API (attempt {attempt + 1}): {e}")
             if attempt < max_retries:
                 continue
-            return None
+            raise RuntimeError(f"LLM API request failed after {max_retries + 1} attempts: {e}") from e
 
         # Clean and parse JSON response
         json_text = clean_json_string(text)
@@ -173,6 +194,14 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
         entries = repair_json_array(json_text)
 
         if entries and len(entries) > 0:
+            try:
+                entries = annotations_to_entries(segments, entries)
+            except ValueError as exc:
+                print(f"Warning: Invalid segment annotations in batch {batch_num}: {exc}")
+                if attempt < max_retries:
+                    user_prompt += f"\n\nVALIDATION FEEDBACK: {exc}"
+                    continue
+                return None
             if attempt > 0:
                 print(f"  Succeeded on retry {attempt + 1}")
             return entries
@@ -181,12 +210,6 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
 
         if attempt < max_retries:
             print("Retrying...")
-
-        # Last resort
-        salvaged = salvage_json_entries(json_text)
-        if salvaged:
-            print(f"Regex-salvaged {len(salvaged)} entries from malformed response")
-            return salvaged
 
     return None
 
@@ -371,28 +394,27 @@ def main():
             )
 
             if corrected is None:
-                print(f"  FAILED — keeping original entries for batch {batch_index}")
-                all_corrected.extend(batch)
-                total_stats["batches_failed"] += 1
-                previous_tail = batch[-2:] if len(batch) >= 2 else batch
-                continue
+                print(f"Error: Batch {batch_index} failed metadata validation")
+                sys.exit(1)
 
             corrected, normalized_count = normalize_unsafe_speakers(
                 corrected, first_person_speaker
             )
             if normalized_count:
                 print(f"  Normalized {normalized_count} unsafe speaker label(s) to {first_person_speaker!r}")
+
+            speaker_errors = validate_speakers_for_source(corrected, combined_script_text(batch))
+            if speaker_errors:
+                print(f"Error: Batch {batch_index} produced invalid speaker labels: {'; '.join(speaker_errors[:5])}")
+                sys.exit(1)
             schema_errors = validate_script_entries(corrected)
             passed, orig_text, corr_text, ratio = check_text_loss(batch, corrected)
             if schema_errors or not passed:
                 if schema_errors:
                     print(f"  WARNING: Invalid reviewed entries: {'; '.join(schema_errors[:3])}")
                 print(f"  WARNING: Text changed or was lost (normalized character ratio: {ratio:.3f}).")
-                print(f"  Keeping original entries for batch {batch_index} to prevent data corruption.")
-                all_corrected.extend(batch)
-                total_stats["batches_failed"] += 1
-                previous_tail = batch[-2:] if len(batch) >= 2 else batch
-                continue
+                print(f"Error: Batch {batch_index} failed quality validation")
+                sys.exit(1)
 
             stats = diff_entries(batch, corrected)
             entry_diff = len(corrected) - len(batch)
@@ -450,11 +472,8 @@ def main():
             )
 
             if corrected is None:
-                print(f"  FAILED — keeping original entries for batch {i}")
-                all_corrected.extend(batch)
-                total_stats["batches_failed"] += 1
-                previous_tail = batch[-2:] if len(batch) >= 2 else batch
-                continue
+                print(f"Error: Batch {i} failed metadata validation")
+                sys.exit(1)
 
             # Text-loss safety check
             corrected, normalized_count = normalize_unsafe_speakers(
@@ -462,17 +481,19 @@ def main():
             )
             if normalized_count:
                 print(f"  Normalized {normalized_count} unsafe speaker label(s) to {first_person_speaker!r}")
+
+            speaker_errors = validate_speakers_for_source(corrected, combined_script_text(batch))
+            if speaker_errors:
+                print(f"Error: Batch {i} produced invalid speaker labels: {'; '.join(speaker_errors[:5])}")
+                sys.exit(1)
             schema_errors = validate_script_entries(corrected)
             passed, orig_text, corr_text, ratio = check_text_loss(batch, corrected)
             if schema_errors or not passed:
                 if schema_errors:
                     print(f"  WARNING: Invalid reviewed entries: {'; '.join(schema_errors[:3])}")
                 print(f"  WARNING: Text changed or was lost (normalized character ratio: {ratio:.3f}).")
-                print(f"  Keeping original entries for batch {i} to prevent data corruption.")
-                all_corrected.extend(batch)
-                total_stats["batches_failed"] += 1
-                previous_tail = batch[-2:] if len(batch) >= 2 else batch
-                continue
+                print(f"Error: Batch {i} failed quality validation")
+                sys.exit(1)
 
             # Diff stats
             stats = diff_entries(batch, corrected)

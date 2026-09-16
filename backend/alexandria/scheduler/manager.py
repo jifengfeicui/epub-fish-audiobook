@@ -21,9 +21,10 @@ class Scheduler:
         self._thread.start()
 
     def stop(self) -> None:
+        self.repo.pause_active_jobs_for_shutdown()
         self._stop.set()
         if self._thread:
-            self._thread.join(timeout=5)
+            self._thread.join()
 
     def _loop(self) -> None:
         while not self._stop.is_set():

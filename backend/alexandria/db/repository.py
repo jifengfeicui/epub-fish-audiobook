@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import re
+import shutil
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -100,10 +102,11 @@ class Repository:
             session.add(project)
         return self.get_project(project_id)
 
-    def list_projects(self) -> list[dict[str, Any]]:
+    def list_projects(self, archived: bool = False) -> list[dict[str, Any]]:
         with self.db.session() as session:
             projects = session.scalars(
                 select(Project)
+                .where(Project.archived_at.is_not(None) if archived else Project.archived_at.is_(None))
                 .options(joinedload(Project.settings), selectinload(Project.chapters))
                 .order_by(Project.updated_at.desc())
             ).unique().all()
@@ -137,6 +140,7 @@ class Repository:
             "chapter_status_counts": counts,
             "created_at": _iso(project.created_at),
             "updated_at": _iso(project.updated_at),
+            "archived_at": _iso(project.archived_at),
             "settings": {
                 "render_start_mode": settings.render_start_mode,
                 "release_batch_size": settings.release_batch_size,
@@ -147,7 +151,6 @@ class Repository:
                 "single_speaker": settings.single_speaker,
                 "speaker_name": settings.speaker_name,
                 "instruct": settings.instruct,
-                "workers": settings.workers,
             },
             "latest_job": self.job_dict(job) if job else None,
         }
@@ -162,6 +165,9 @@ class Repository:
             )
             if active and any(key != "title" for key in values):
                 raise RuntimeError("project_running")
+            archived = values.pop("archived", None)
+            if archived is not None:
+                project.archived_at = utcnow() if archived else None
             if values.get("title") is not None:
                 project.title = values.pop("title")
             for key, value in values.items():
@@ -173,6 +179,61 @@ class Repository:
             if start > end or end > len(project.chapters):
                 raise RuntimeError("invalid_chapter_range")
             project.updated_at = utcnow()
+        return self.get_project(project_id)
+
+    def delete_project(self, project_id: str) -> None:
+        with self.db.session() as session, session.begin():
+            project = session.get(Project, project_id)
+            if project is None:
+                raise KeyError(project_id)
+            active = session.scalar(
+                select(Job.id).where(Job.project_id == project_id, Job.status.in_(ACTIVE_JOB_STATES)).limit(1)
+            )
+            if active:
+                raise RuntimeError("project_running")
+            session.delete(project)
+        shutil.rmtree(self.storage_root / "projects" / project_id, ignore_errors=True)
+
+    def reparse_project(self, project_id: str) -> dict[str, Any]:
+        from tools.render_book import inspect_book
+
+        with self.db.session() as session:
+            record = session.get(Project, project_id)
+            if record is None:
+                raise KeyError(project_id)
+            source_path = record.source_path
+        source = (self.storage_root / source_path).resolve()
+        if self.storage_root not in source.parents or not source.is_file():
+            raise FileNotFoundError(source)
+        chapters = inspect_book(source)
+        if not chapters:
+            raise ValueError("No readable chapters found")
+        with self.db.session() as session, session.begin():
+            record = session.get(Project, project_id)
+            active = session.scalar(select(Job.id).where(Job.project_id == project_id, Job.status.in_(ACTIVE_JOB_STATES)).limit(1))
+            if active:
+                raise RuntimeError("project_running")
+            session.execute(delete(Job).where(Job.project_id == project_id))
+            session.execute(delete(SpeakerAssignment).where(SpeakerAssignment.project_id == project_id))
+            session.execute(delete(Artifact).where(Artifact.project_id == project_id))
+            session.execute(delete(AudioSegment).where(AudioSegment.project_id == project_id))
+            session.execute(delete(Chapter).where(Chapter.project_id == project_id))
+            for chapter in chapters:
+                session.add(Chapter(
+                    project_id=project_id,
+                    position=int(chapter["index"]),
+                    title=str(chapter["title"]),
+                    href=str(chapter["href"]),
+                    source_text=str(chapter["text"]),
+                    source_hash=_hash_json([chapter["href"], chapter["title"], chapter["text"]]),
+                ))
+            record.status = "ready"
+            record.settings.from_chapter = None
+            record.settings.to_chapter = None
+            record.updated_at = utcnow()
+        project_dir = self.storage_root / "projects" / project_id
+        for name in ("audio", "work", "output"):
+            shutil.rmtree(project_dir / name, ignore_errors=True)
         return self.get_project(project_id)
 
     def list_chapters(self, project_id: str) -> list[dict[str, Any]]:
@@ -283,13 +344,18 @@ class Repository:
             session.execute(update(AudioSegment).where(AudioSegment.chapter_id == chapter_id).values(status="stale"))
             chapter = session.get(Chapter, chapter_id)
             chapter.status = "reviewed"
+            project = session.get(Project, project_id)
+            project.status = "ready_for_tts"
+            project.updated_at = utcnow()
         return result
 
-    def create_job(self, project_id: str) -> dict[str, Any]:
+    def create_job(self, project_id: str, job_type: str = "preprocess") -> dict[str, Any]:
         with self._job_lock:
-            return self._create_job(project_id)
+            return self._create_job(project_id, job_type)
 
-    def _create_job(self, project_id: str) -> dict[str, Any]:
+    def _create_job(self, project_id: str, job_type: str) -> dict[str, Any]:
+        if job_type not in ("preprocess", "render"):
+            raise ValueError("Invalid job type")
         with self.db.session() as session, session.begin():
             project = session.get(Project, project_id)
             if project is None:
@@ -302,9 +368,19 @@ class Repository:
             )
             if resumable:
                 raise RuntimeError("resumable_job")
+            if job_type == "render":
+                chapters = self.list_selected_chapters(project_id)
+                ready = 0
+                for chapter in chapters:
+                    record = session.get(Chapter, chapter["id"])
+                    revision = session.get(ScriptRevision, record.active_revision_id) if record.active_revision_id else None
+                    ready += int(revision is not None and revision.kind in ("reviewed", "manual"))
+                if not chapters or ready != len(chapters):
+                    raise RuntimeError("render_not_ready")
             job = Job(
                 id=str(uuid.uuid4()),
                 project_id=project_id,
+                job_type=job_type,
                 status="queued",
                 render_start_mode=project.settings.render_start_mode,
                 release_batch_size=project.settings.release_batch_size,
@@ -313,6 +389,13 @@ class Repository:
             session.add(job)
         self.add_event(job.id, project_id, "job.queued", {"status": "queued"})
         return self.get_job(job.id)
+
+    def set_project_status(self, project_id: str, status: str) -> None:
+        with self.db.session() as session, session.begin():
+            project = session.get(Project, project_id)
+            if project:
+                project.status = status
+                project.updated_at = utcnow()
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         with self.db.session() as session:
@@ -505,11 +588,14 @@ class Repository:
         with self.db.session() as session:
             rows = session.scalars(select(VoiceProfile).order_by(VoiceProfile.pool_order, VoiceProfile.name)).all()
             return [
-                {"id": row.id, "reference_id": row.reference_id, "name": row.name, "bound_speaker": row.bound_speaker, "pool_order": row.pool_order}
+                {"id": row.id, "reference_id": row.reference_id, "name": row.name, "bound_speaker": row.bound_speaker, "pool_order": row.pool_order, "gender": row.gender, "traits": row.traits}
                 for row in rows
             ]
 
     def replace_voices(self, voices: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        bindings = [voice.get("bound_speaker") for voice in voices if voice.get("bound_speaker")]
+        if any(binding != "NARRATOR" for binding in bindings) or len(bindings) > 1:
+            raise RuntimeError("Only one Fish voice may be bound to NARRATOR")
         with self.db.session() as session, session.begin():
             active = session.scalar(select(Job.id).where(Job.status.in_(ACTIVE_JOB_STATES)).limit(1))
             if active:
@@ -534,10 +620,13 @@ class Repository:
                 row.name = voice["name"]
                 row.bound_speaker = voice.get("bound_speaker") or None
                 row.pool_order = voice.get("pool_order", 0)
+                row.gender = voice.get("gender", "").strip()
+                row.traits = voice.get("traits", "").strip()
         return self.list_voices()
 
     def assign_voices(self, project_id: str, speakers: list[str]) -> dict[str, dict[str, str]]:
-        with self.db.session() as session, session.begin():
+        """Resolve explicit choices and chapter-local random choices without persisting randomness."""
+        with self.db.session() as session:
             profiles = session.scalars(select(VoiceProfile).order_by(VoiceProfile.pool_order, VoiceProfile.name)).all()
             if not profiles:
                 raise RuntimeError("No Fish voices configured")
@@ -545,37 +634,152 @@ class Repository:
             existing = {row.speaker: row.voice_profile_id for row in existing_rows}
             by_id = {row.id: row for row in profiles}
             bound = {row.bound_speaker: row for row in profiles if row.bound_speaker}
-            reserved = {row.id for row in bound.values()}
-            pool = [row for row in profiles if row.id not in reserved]
-            pool_position = sum(1 for profile_id in existing.values() if profile_id not in reserved)
+            reserved = {profile_id for profile_id in existing.values() if profile_id} | {row.id for row in bound.values()}
+            pool = [row for row in profiles if row.id not in reserved and not row.bound_speaker]
+            resolved: dict[str, VoiceProfile] = {}
             for speaker in speakers:
-                if speaker in existing:
-                    continue
-                profile = bound.get(speaker)
-                if profile is None:
-                    if not pool:
+                profile = resolved.get(speaker) or bound.get(speaker) or by_id.get(existing.get(speaker, ""))
+                if profile is None and speaker != "NARRATOR":
+                    character = next((row for row in existing_rows if row.speaker == speaker), None)
+                    preferred = [row for row in pool if character and character.gender and row.gender == character.gender]
+                    choices = preferred or pool
+                    if not choices:
                         raise RuntimeError(f"No unbound Fish voice available for {speaker}")
-                    profile = pool[pool_position % len(pool)]
-                    pool_position += 1
-                session.add(SpeakerAssignment(project_id=project_id, speaker=speaker, voice_profile_id=profile.id))
-                existing[speaker] = profile.id
+                    profile = random.choice(choices)
+                if profile is None:
+                    raise RuntimeError("A Fish voice must be bound to NARRATOR")
+                resolved[speaker] = profile
             return {
-                speaker: {"reference_id": by_id[existing[speaker]].reference_id, "name": by_id[existing[speaker]].name}
-                for speaker in speakers
+                speaker: {"reference_id": resolved[speaker].reference_id, "name": resolved[speaker].name}
+                for speaker in resolved
             }
 
     def list_speaker_assignments(self, project_id: str) -> list[dict[str, str]]:
         with self.db.session() as session:
             rows = session.execute(
                 select(SpeakerAssignment, VoiceProfile)
-                .join(VoiceProfile, VoiceProfile.id == SpeakerAssignment.voice_profile_id)
+                .outerjoin(VoiceProfile, VoiceProfile.id == SpeakerAssignment.voice_profile_id)
                 .where(SpeakerAssignment.project_id == project_id)
                 .order_by(SpeakerAssignment.created_at)
             ).all()
             return [
-                {"speaker": assignment.speaker, "voice_name": voice.name, "reference_id": voice.reference_id}
+                {"speaker": assignment.speaker, "voice_name": voice.name if voice else "", "reference_id": voice.reference_id if voice else ""}
                 for assignment, voice in rows
             ]
+
+    def refresh_characters(self, project_id: str) -> list[dict[str, Any]]:
+        with self.db.session() as session, session.begin():
+            chapters = session.scalars(select(Chapter).where(Chapter.project_id == project_id).order_by(Chapter.position)).all()
+            stats: dict[str, dict[str, Any]] = {}
+            seen = 0
+            for chapter in chapters:
+                if not chapter.active_revision_id:
+                    continue
+                entries = session.scalars(
+                    select(ScriptEntry).where(ScriptEntry.revision_id == chapter.active_revision_id).order_by(ScriptEntry.position)
+                ).all()
+                for entry in entries:
+                    speaker = entry.speaker.strip()
+                    if not speaker or speaker == "NARRATOR":
+                        continue
+                    if speaker not in stats:
+                        seen += 1
+                        stats[speaker] = {"line_count": 0, "importance": 0, "first_seen": seen}
+                    stats[speaker]["line_count"] += 1
+                    stats[speaker]["importance"] += len(entry.text.strip())
+            rows = {row.speaker: row for row in session.scalars(
+                select(SpeakerAssignment).where(SpeakerAssignment.project_id == project_id)
+            ).all()}
+            for speaker, values in stats.items():
+                row = rows.get(speaker)
+                if row is None:
+                    row = SpeakerAssignment(project_id=project_id, speaker=speaker)
+                    session.add(row)
+                    rows[speaker] = row
+                row.line_count = values["line_count"]
+                row.importance = values["importance"]
+                row.first_seen = values["first_seen"]
+            stale = set(rows) - set(stats)
+            if stale:
+                session.execute(delete(SpeakerAssignment).where(
+                    SpeakerAssignment.project_id == project_id,
+                    SpeakerAssignment.speaker.in_(stale),
+                ))
+        return self.list_characters(project_id)
+
+    def list_characters(self, project_id: str) -> list[dict[str, Any]]:
+        with self.db.session() as session:
+            rows = session.execute(
+                select(SpeakerAssignment, VoiceProfile)
+                .outerjoin(VoiceProfile, VoiceProfile.id == SpeakerAssignment.voice_profile_id)
+                .where(SpeakerAssignment.project_id == project_id)
+                .order_by(SpeakerAssignment.importance.desc(), SpeakerAssignment.first_seen)
+            ).all()
+            return [{
+                "speaker": row.speaker,
+                "gender": row.gender,
+                "personality": row.personality,
+                "line_count": row.line_count,
+                "importance": row.importance,
+                "voice_profile_id": row.voice_profile_id,
+                "voice_name": voice.name if voice else "",
+                "user_edited": row.user_edited,
+            } for row, voice in rows]
+
+    def character_samples(self, project_id: str, speakers: list[str]) -> dict[str, list[str]]:
+        wanted = set(speakers)
+        samples = {speaker: [] for speaker in speakers}
+        with self.db.session() as session:
+            chapters = session.scalars(select(Chapter).where(Chapter.project_id == project_id).order_by(Chapter.position)).all()
+            for chapter in chapters:
+                if not chapter.active_revision_id:
+                    continue
+                entries = session.scalars(
+                    select(ScriptEntry).where(ScriptEntry.revision_id == chapter.active_revision_id).order_by(ScriptEntry.position)
+                ).all()
+                for entry in entries:
+                    if entry.speaker in wanted and len(samples[entry.speaker]) < 8:
+                        samples[entry.speaker].append(entry.text.strip())
+        return samples
+
+    def update_characters(self, project_id: str, characters: list[dict[str, Any]], *, automated: bool = False) -> list[dict[str, Any]]:
+        with self.db.session() as session, session.begin():
+            active = session.scalar(select(Job.id).where(Job.project_id == project_id, Job.status.in_(ACTIVE_JOB_STATES)).limit(1))
+            if active and not automated:
+                raise RuntimeError("project_running")
+            voices = {row.id: row for row in session.scalars(select(VoiceProfile)).all()}
+            for values in characters:
+                row = session.scalar(select(SpeakerAssignment).where(
+                    SpeakerAssignment.project_id == project_id,
+                    SpeakerAssignment.speaker == values["speaker"],
+                ))
+                if row is None or (automated and row.user_edited):
+                    continue
+                voice_id = values.get("voice_profile_id")
+                if voice_id and (voice_id not in voices or voices[voice_id].bound_speaker):
+                    raise RuntimeError("Character voices must come from the unbound Fish voice pool")
+                row.gender = values.get("gender", "").strip()
+                row.personality = values.get("personality", "").strip()
+                if not automated:
+                    row.voice_profile_id = voice_id or None
+                    row.user_edited = True
+            if not automated:
+                session.execute(update(Artifact).where(Artifact.project_id == project_id, Artifact.status == "active").values(status="stale"))
+                session.execute(update(AudioSegment).where(AudioSegment.project_id == project_id).values(status="stale"))
+                project = session.get(Project, project_id)
+                project.status = "ready_for_tts"
+                project.updated_at = utcnow()
+        return self.list_characters(project_id)
+
+    def pause_active_jobs_for_shutdown(self) -> None:
+        with self.db.session() as session, session.begin():
+            jobs = session.scalars(select(Job).where(Job.status.in_(ACTIVE_JOB_STATES))).all()
+            for job in jobs:
+                job.cancel_requested = True
+                job.status = "paused" if job.status == "queued" else "pausing"
+                project = session.get(Project, job.project_id)
+                if project:
+                    project.status = job.status
 
     def update_chapter_status(self, chapter_id: int, status: str) -> None:
         with self.db.session() as session, session.begin():

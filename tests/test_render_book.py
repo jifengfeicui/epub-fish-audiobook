@@ -17,6 +17,7 @@ from render_book import (  # noqa: E402
     build_parser,
     concat_mp3,
     inspect_epub,
+    inspect_txt,
     merge_mp3,
     release_batches,
 )
@@ -55,6 +56,35 @@ class EpubTests(unittest.TestCase):
         self.assertEqual([item["title"] for item in chapters], ["第一章", "第一章"])
         self.assertIn("第一章正文", chapters[0]["text"])
         self.assertIn("第二个章节", chapters[1]["text"])
+
+
+class TxtTests(unittest.TestCase):
+    def test_attached_traditional_chapter_titles(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "青山_5.txt"
+            path.write_text(
+                "第1章歸零\n正文一\n第2章親戚\n正文二\n第3章石中火，夢中身\n正文三\n第4章一刻鐘\n正文四",
+                encoding="utf-8",
+            )
+            chapters = inspect_txt(path)
+        self.assertEqual(
+            [row["title"] for row in chapters],
+            ["第1章歸零", "第2章親戚", "第3章石中火，夢中身", "第4章一刻鐘"],
+        )
+
+    def test_utf8_gb18030_chapters_and_single_chapter_fallback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            utf8 = root / "utf8.txt"
+            utf8.write_text("序言\n第 1 章 开始\n正文一\nChapter 2: Next\n正文二", encoding="utf-8")
+            gb = root / "gb.txt"
+            gb.write_bytes("第一节 相遇\n内容\n第二节 离开\n结尾".encode("gb18030"))
+            plain = root / "plain.txt"
+            plain.write_text("没有章节标题\n整本正文", encoding="utf-8")
+
+            self.assertEqual([row["title"] for row in inspect_txt(utf8)], ["第1章", "第 1 章 开始", "Chapter 2_ Next"])
+            self.assertEqual([row["title"] for row in inspect_txt(gb)], ["第一节 相遇", "第二节 离开"])
+            self.assertEqual(len(inspect_txt(plain)), 1)
 
 
 class VoiceAssignmentTests(unittest.TestCase):

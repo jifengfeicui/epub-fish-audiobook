@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+import sys
 from pathlib import Path
 
 try:
@@ -12,8 +13,9 @@ try:
     from backend.alexandria.db.repository import Repository
     from backend.alexandria.scheduler.broker import EventBroker
     from backend.alexandria.scheduler.runner import PipelineRunner
+    from backend.alexandria.services.stages import StageCancelled, StageExecutor
 except ImportError:
-    Database = Artifact = AudioSegment = StageRun = Repository = EventBroker = PipelineRunner = None
+    Database = Artifact = AudioSegment = StageRun = Repository = EventBroker = PipelineRunner = StageCancelled = StageExecutor = None
 
 
 def chapter_rows(count: int) -> list[dict]:
@@ -33,7 +35,7 @@ class RepositoryTestCase(unittest.TestCase):
         self.repo = Repository(self.database, root)
 
     def tearDown(self):
-        self.database.engine.dispose()
+        self.database.close()
         self.temp.cleanup()
 
     def project(self, count: int = 2, **settings):
@@ -67,6 +69,22 @@ class RepositoryTests(RepositoryTestCase):
         self.repo.create_job(first["id"])
         with self.assertRaisesRegex(RuntimeError, "active_job"):
             self.repo.create_job(second["id"])
+
+    def test_archive_restore_delete_and_active_job_protection(self):
+        project = self.project()
+        job = self.repo.create_job(project["id"])
+        with self.assertRaisesRegex(RuntimeError, "project_running"):
+            self.repo.update_project(project["id"], {"archived": True})
+        with self.assertRaisesRegex(RuntimeError, "project_running"):
+            self.repo.delete_project(project["id"])
+        self.repo.cancel_job(job["id"])
+        self.repo.update_project(project["id"], {"archived": True})
+        self.assertEqual([row["id"] for row in self.repo.list_projects(True)], [project["id"]])
+        self.repo.update_project(project["id"], {"archived": False})
+        self.assertEqual([row["id"] for row in self.repo.list_projects(False)], [project["id"]])
+        self.repo.delete_project(project["id"])
+        with self.assertRaises(KeyError):
+            self.repo.get_project(project["id"])
 
     def test_pause_resume_cancel_and_restart_interruption(self):
         project = self.project()
@@ -112,17 +130,45 @@ class RepositoryTests(RepositoryTestCase):
             thread.join()
         self.assertEqual(published, sorted(published))
 
-    def test_voice_assignment_is_stable_as_new_speakers_appear(self):
+    def test_voice_assignment_uses_explicit_choice_and_gender_without_persisting_random_choice(self):
         project = self.project()
-        self.repo.replace_voices([
-            {"reference_id": "narrator", "name": "Narrator", "bound_speaker": "NARRATOR", "pool_order": 0},
-            {"reference_id": "a", "name": "A", "pool_order": 1},
-            {"reference_id": "b", "name": "B", "pool_order": 2},
+        voices = self.repo.replace_voices([
+            {"reference_id": "narrator", "name": "Narrator", "bound_speaker": "NARRATOR", "pool_order": 0, "gender": "female"},
+            {"reference_id": "a", "name": "A", "pool_order": 1, "gender": "female"},
+            {"reference_id": "b", "name": "B", "pool_order": 2, "gender": "male"},
         ])
-        first = self.repo.assign_voices(project["id"], ["NARRATOR", "Alice"])
-        second = self.repo.assign_voices(project["id"], ["Alice", "Bob"])
-        self.assertEqual(first["Alice"], second["Alice"])
-        self.assertEqual(second["Bob"]["reference_id"], "b")
+        chapter = self.repo.list_chapters(project["id"])[0]
+        self.repo.save_revision(chapter["id"], "reviewed", [
+            {"speaker": "Alice", "text": "hello", "instruct": ""},
+            {"speaker": "Bob", "text": "hello", "instruct": ""},
+        ])
+        self.repo.refresh_characters(project["id"])
+        by_reference = {voice["reference_id"]: voice for voice in voices}
+        self.repo.update_characters(project["id"], [
+            {"speaker": "Alice", "gender": "female", "personality": "", "voice_profile_id": None},
+            {"speaker": "Bob", "gender": "male", "personality": "", "voice_profile_id": by_reference["b"]["id"]},
+        ])
+
+        assigned = self.repo.assign_voices(project["id"], ["NARRATOR", "Alice", "Alice", "Bob"])
+
+        self.assertEqual(assigned["NARRATOR"]["reference_id"], "narrator")
+        self.assertEqual(assigned["Alice"]["reference_id"], "a")
+        self.assertEqual(assigned["Bob"]["reference_id"], "b")
+        self.assertIsNone(next(item for item in self.repo.list_characters(project["id"]) if item["speaker"] == "Alice")["voice_profile_id"])
+
+    def test_character_importance_sort_and_automated_updates_preserve_manual_metadata(self):
+        project = self.project()
+        chapters = self.repo.list_chapters(project["id"])
+        self.repo.save_revision(chapters[0]["id"], "reviewed", [
+            {"speaker": "Small", "text": "短", "instruct": ""},
+            {"speaker": "NARRATOR", "text": "旁白不进入角色池", "instruct": ""},
+            {"speaker": "Large", "text": "这是一段更长的台词", "instruct": ""},
+        ])
+        self.assertEqual([row["speaker"] for row in self.repo.refresh_characters(project["id"])], ["Large", "Small"])
+        self.repo.update_characters(project["id"], [{"speaker": "Large", "gender": "女", "personality": "人工资料", "voice_profile_id": None}])
+        self.repo.update_characters(project["id"], [{"speaker": "Large", "gender": "男", "personality": "自动资料"}], automated=True)
+        large = self.repo.list_characters(project["id"])[0]
+        self.assertEqual((large["gender"], large["personality"], large["user_edited"]), ("女", "人工资料", True))
 
     def test_script_edit_preserves_text_and_invalidates_only_its_audio(self):
         project = self.project()
@@ -163,8 +209,14 @@ class FakeExecutor:
         self.review_four_started = threading.Event()
         self.render_one_started = threading.Event()
         self.overlapped = False
+        self.generated = []
+        self.reviewed = []
+        self.rendered = []
+        self.analyzed = 0
+        self.merged = 0
 
-    def generate(self, chapter_id, project, log):
+    def generate(self, chapter_id, project, log, should_stop=lambda: False):
+        self.generated.append(chapter_id)
         return self.repo.save_revision(chapter_id, "generated", [{"speaker": "NARRATOR", "text": "text", "instruct": ""}], self.generate_input_hash(chapter_id, project))
 
     def generate_input_hash(self, chapter_id, project):
@@ -173,7 +225,8 @@ class FakeExecutor:
     def review_input_hash(self, generated, project):
         return f"review-{generated['content_hash']}"
 
-    def review(self, chapter_id, project, generated, log):
+    def review(self, chapter_id, project, generated, log, should_stop=lambda: False):
+        self.reviewed.append(chapter_id)
         chapter = self.repo.get_chapter_record(chapter_id)
         if chapter.position == 4:
             self.review_four_started.set()
@@ -181,6 +234,7 @@ class FakeExecutor:
         return self.repo.save_revision(chapter_id, "reviewed", generated["entries"], self.review_input_hash(generated, project))
 
     def render(self, chapter_id, project, log):
+        self.rendered.append(chapter_id)
         chapter = self.repo.get_chapter_record(chapter_id)
         if chapter.position == 1:
             self.render_one_started.set()
@@ -191,7 +245,12 @@ class FakeExecutor:
         self.repo.save_artifact(project["id"], chapter_id, "chapter_mp3", path)
         return path
 
+    def analyze_characters(self, project):
+        self.analyzed += 1
+        return self.repo.list_characters(project["id"])
+
     def merge_book(self, project, log):
+        self.merged += 1
         path = self.repo.storage_root / "projects" / project["id"] / "output" / "book.mp3"
         path.write_bytes(b"book")
         self.repo.save_artifact(project["id"], None, "book_mp3", path)
@@ -199,15 +258,57 @@ class FakeExecutor:
 
 
 class PipelineTests(RepositoryTestCase):
-    def test_review_and_tts_channels_overlap_after_three_chapters(self):
-        project = self.project(4, release_batch_size=3)
-        job = self.repo.create_job(project["id"])
+    def test_stage_process_logs_utf8(self):
+        messages = []
+        StageExecutor(self.repo, Path(__file__).parents[1])._run(
+            [sys.executable, "-c", "print('\u9752\u5c71')"],
+            messages.append,
+        )
+        self.assertEqual(messages, ["\u9752\u5c71"])
+
+    def test_stage_process_stops_when_job_is_cancelled(self):
+        executor = StageExecutor(self.repo, Path(__file__).parents[1])
+        stop = threading.Event()
+        timer = threading.Timer(0.2, stop.set)
+        timer.start()
+        started = time.monotonic()
+        try:
+            with self.assertRaises(StageCancelled):
+                executor._run(
+                    [sys.executable, "-u", "-c", "import time; print('started'); time.sleep(10)"],
+                    lambda _message: None,
+                    stop.is_set,
+                )
+        finally:
+            timer.cancel()
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_preprocess_stops_before_tts_and_render_only_runs_tts(self):
+        project = self.project(2)
         executor = FakeExecutor(self.repo)
-        PipelineRunner(self.repo, executor, EventBroker()).run(job["id"])
-        self.assertTrue(executor.overlapped)
-        self.assertEqual(self.repo.get_job(job["id"])["status"], "completed")
-        event_types = [event["type"] for event in self.repo.list_events(project["id"])]
-        self.assertLess(event_types.index("render.batch_released"), event_types.index("render.batch_started"))
+        preprocess = self.repo.create_job(project["id"], "preprocess")
+        PipelineRunner(self.repo, executor, EventBroker()).run(preprocess["id"])
+
+        self.assertEqual(len(executor.generated), 2)
+        self.assertEqual(len(executor.reviewed), 2)
+        self.assertEqual(executor.rendered, [])
+        self.assertEqual(executor.merged, 0)
+        self.assertEqual(self.repo.get_project(project["id"])["status"], "ready_for_tts")
+
+        render = self.repo.create_job(project["id"], "render")
+        PipelineRunner(self.repo, executor, EventBroker()).run(render["id"])
+        self.assertEqual(len(executor.generated), 2)
+        self.assertEqual(len(executor.reviewed), 2)
+        self.assertEqual(len(executor.rendered), 2)
+        self.assertEqual(executor.merged, 1)
+        self.assertEqual(self.repo.get_job(render["id"])["status"], "completed")
+
+    def test_render_requires_every_selected_chapter_to_be_preprocessed(self):
+        project = self.project(2)
+        chapter = self.repo.list_chapters(project["id"])[0]
+        self.repo.save_revision(chapter["id"], "reviewed", [{"speaker": "NARRATOR", "text": "text", "instruct": ""}])
+        with self.assertRaisesRegex(RuntimeError, "render_not_ready"):
+            self.repo.create_job(project["id"], "render")
 
     def test_pause_after_generate_does_not_start_review(self):
         project = self.project(1)
@@ -215,7 +316,7 @@ class PipelineTests(RepositoryTestCase):
         executor = FakeExecutor(self.repo)
         generate = executor.generate
 
-        def generate_then_pause(chapter_id, project_data, log):
+        def generate_then_pause(chapter_id, project_data, log, should_stop=lambda: False):
             result = generate(chapter_id, project_data, log)
             self.repo.request_pause(job["id"])
             return result

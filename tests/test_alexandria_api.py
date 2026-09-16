@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from io import BytesIO
 
 try:
     from fastapi.testclient import TestClient
@@ -29,6 +30,34 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["fish_api_key"], "********")
         self.assertNotIn("top-secret", self.client.get("/api/v1/settings").text)
+
+    def test_fish_workers_default_and_range(self):
+        self.assertEqual(self.client.get("/api/v1/settings").json()["fish_workers"], 5)
+        self.assertEqual(self.client.put("/api/v1/settings", json={"fish_workers": 16}).json()["fish_workers"], 16)
+        self.assertEqual(self.client.put("/api/v1/settings", json={"fish_workers": 0}).status_code, 422)
+        self.assertEqual(self.client.put("/api/v1/settings", json={"fish_workers": 17}).status_code, 422)
+
+    def test_job_types_render_gate_and_reparse(self):
+        source = "第1章歸零\n正文\n第2章親戚\n正文"
+        created = self.client.post(
+            "/api/v1/projects",
+            files={"file": ("book.txt", BytesIO(source.encode("utf-8")), "text/plain")},
+        )
+        self.assertEqual(created.status_code, 201)
+        project_id = created.json()["id"]
+        self.assertEqual(len(self.client.get(f"/api/v1/projects/{project_id}/chapters").json()), 2)
+        self.assertEqual(
+            self.client.post(f"/api/v1/projects/{project_id}/jobs", json={"type": "render"}).status_code,
+            409,
+        )
+        job = self.client.post(f"/api/v1/projects/{project_id}/jobs", json={"type": "preprocess"})
+        self.assertEqual(job.status_code, 201)
+        self.assertEqual(job.json()["type"], "preprocess")
+        self.assertEqual(self.client.post(f"/api/v1/projects/{project_id}/reparse").status_code, 409)
+        self.client.post(f"/api/v1/jobs/{job.json()['id']}/cancel")
+        reparsed = self.client.post(f"/api/v1/projects/{project_id}/reparse")
+        self.assertEqual(reparsed.status_code, 200)
+        self.assertIsNone(reparsed.json()["latest_job"])
 
 
 if __name__ == "__main__":

@@ -9,12 +9,136 @@ from script_validation import (
     compare_text_fidelity,
     format_fidelity_error,
     normalize_unsafe_speakers,
+    validate_speakers_for_source,
     validate_script_entries,
 )
 
 # Cap for single-speaker mode: entries at this size pass through
 # group_into_chunks (MAX_CHUNK_CHARS=500) as-is without further splitting.
 SINGLE_SPEAKER_MAX_CHARS = 500
+
+
+def split_annotation_segments(text):
+    """Split text for speaker annotation while keeping every character immutable."""
+    pairs = {"“": "”", "「": "」", "『": "』", '"': '"'}
+    endings = set("。！？!?；;\n")
+    segments = []
+    buffer = ""
+    quote_end = None
+    for char in text:
+        if quote_end is None and char in pairs:
+            if buffer:
+                segments.append(buffer)
+                buffer = ""
+            quote_end = pairs[char]
+        buffer += char
+        if quote_end is not None and char == quote_end and len(buffer) > 1:
+            segments.append(buffer)
+            buffer = ""
+            quote_end = None
+        elif quote_end is None and char in endings:
+            segments.append(buffer)
+            buffer = ""
+    if buffer:
+        segments.append(buffer)
+    compact = []
+    pending = ""
+    for segment in segments:
+        if segment.strip():
+            compact.append(pending + segment)
+            pending = ""
+        else:
+            pending += segment
+    if pending and compact:
+        compact[-1] += pending
+    return [
+        {"segment_id": f"s{index:04d}", "text": segment}
+        for index, segment in enumerate(compact, 1)
+        if segment.strip()
+    ]
+
+
+def split_annotation_chunks(text, max_size, max_segments=30):
+    chunks = []
+    current = ""
+    current_segments = 0
+    for segment in split_annotation_segments(text):
+        value = segment["text"]
+        if current and (len(current) + len(value) > max_size or current_segments >= max_segments):
+            chunks.append(current)
+            current = ""
+            current_segments = 0
+        while len(value) > max_size:
+            if current:
+                chunks.append(current)
+                current = ""
+                current_segments = 0
+            chunks.append(value[:max_size])
+            value = value[max_size:]
+        if value:
+            current += value
+            current_segments += 1
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def annotations_to_entries(segments, annotations):
+    expected = [segment["segment_id"] for segment in segments]
+    if not isinstance(annotations, list):
+        raise ValueError("annotation response is not an array")
+    actual = [row.get("segment_id") if isinstance(row, dict) else None for row in annotations]
+    if actual != expected:
+        raise ValueError(f"segment IDs must be complete and ordered: expected {expected}, got {actual}")
+    entries = []
+    for segment, annotation in zip(segments, annotations):
+        if "text" in annotation:
+            raise ValueError("annotation response must not contain text")
+        speaker = annotation.get("speaker")
+        instruct = annotation.get("instruct", "")
+        if not isinstance(speaker, str) or not speaker.strip():
+            raise ValueError(f"invalid speaker for {segment['segment_id']}")
+        if not isinstance(instruct, str):
+            raise ValueError(f"invalid instruct for {segment['segment_id']}")
+        entries.append({"speaker": speaker.strip(), "text": segment["text"], "instruct": instruct.strip()})
+    return entries
+
+
+def annotation_response_format(segments):
+    chinese_source = any(
+        re.search(r"[\u3400-\u9fff]", str(segment.get("text", "")))
+        for segment in segments
+    )
+    speaker_schema = (
+        {"type": "string", "pattern": r"^(?:NARRATOR|[^A-Za-z]*[\u3400-\u9fff][^A-Za-z]*)$"}
+        if chinese_source else {"type": "string", "minLength": 1}
+    )
+
+    def item(segment_id):
+        return {
+            "type": "object",
+            "properties": {
+                "segment_id": {"const": segment_id},
+                "speaker": speaker_schema,
+                "instruct": {"type": "string"},
+            },
+            "required": ["segment_id", "speaker", "instruct"],
+            "additionalProperties": False,
+        }
+
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "segment_annotations",
+            "strict": True,
+            "schema": {
+                "type": "array",
+                "prefixItems": [item(segment["segment_id"]) for segment in segments],
+                "minItems": len(segments),
+                "maxItems": len(segments),
+            },
+        },
+    }
 
 
 def build_lossless_fallback_entries(chunk, speaker_name, instruct="Neutral, even narration."):
@@ -278,7 +402,12 @@ def split_into_chunks(text, max_size=3000):
 def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_entries=None, max_retries=2, system_prompt=None, user_prompt_template=None, max_tokens=4096, temperature=0.6, top_p=0.8, top_k=0, min_p=0, presence_penalty=0.0, banned_tokens=None, first_person_speaker=None):
     """Process a text chunk and return JSON script entries"""
     # Use provided prompts or fall back to defaults
-    sys_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
+    sys_prompt = (system_prompt or DEFAULT_SYSTEM_PROMPT) + (
+        "\n\nHIGHEST PRIORITY OUTPUT CONTRACT: The input contains immutable numbered segments. "
+        "Return only segment_id, speaker, and instruct for every segment in order. Never return a text field. "
+        "Any earlier output examples containing text use an obsolete schema and must be ignored. "
+        "For Chinese source text, speaker labels must use the exact Chinese names or Chinese descriptive roles; never romanize or translate them."
+    )
     usr_template = user_prompt_template or DEFAULT_USER_PROMPT
 
     context_parts = []
@@ -313,7 +442,15 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
         )
 
     context = "\n".join(context_parts)
-    user_prompt = usr_template.format(context=context, chunk=chunk)
+    segments = split_annotation_segments(chunk)
+    segment_json = json.dumps(segments, indent=2, ensure_ascii=False)
+    user_prompt = usr_template.format(context=context, chunk=segment_json) + (
+        "\n\nMANDATORY OUTPUT PROTOCOL:\n"
+        "The source is an array of immutable segments. Return one JSON object for every segment, in the same order. "
+        "Each object must contain only segment_id, speaker, and instruct. Never return or rewrite text. "
+        "Use NARRATOR for narration and structural text. Preserve canonical character names.\n"
+        "The immutable segments are provided above in the configured source section."
+    )
     retry_feedback = ""
 
     for attempt in range(max_retries + 1):
@@ -329,6 +466,8 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
                 top_p=top_p,
                 presence_penalty=presence_penalty,
                 max_tokens=max_tokens,
+                reasoning_effort="none",
+                response_format=annotation_response_format(segments),
                 extra_body={
                     k: v for k, v in {
                         "top_k": top_k if top_k else None,
@@ -368,7 +507,7 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
             print(f"Error calling LLM API (attempt {attempt + 1}): {e}")
             if attempt < max_retries:
                 continue
-            return []
+            raise RuntimeError(f"LLM API request failed after {max_retries + 1} attempts: {e}") from e
 
         # Clean and extract JSON from response
         json_text = clean_json_string(text)
@@ -385,10 +524,19 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
         entries = repair_json_array(json_text)
 
         if entries and len(entries) > 0:
+            try:
+                entries = annotations_to_entries(segments, entries)
+            except ValueError as exc:
+                print(f"  WARNING: Invalid segment annotations: {exc}")
+                if attempt < max_retries:
+                    retry_feedback = f"\n\nVALIDATION FEEDBACK FOR RETRY:\n{exc}\nReturn every required segment ID exactly once and in order."
+                    continue
+                return []
             entries, normalized_count = normalize_unsafe_speakers(entries, first_person_speaker)
             if normalized_count:
                 print(f"  Normalized {normalized_count} unsafe speaker label(s) to {first_person_speaker!r}")
             schema_errors = validate_script_entries(entries)
+            schema_errors.extend(validate_speakers_for_source(entries, chunk))
             fidelity = compare_text_fidelity(chunk, entries)
             if not schema_errors and fidelity.exact:
                 if attempt > 0:
@@ -406,8 +554,9 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
                 retry_feedback = (
                     "\n\nVALIDATION FEEDBACK FOR RETRY:\n"
                     f"Your previous answer was rejected: {problems}\n"
-                    "Return the entire source chunk again. Preserve every character in its original order, "
-                    "apart from outer dialogue quotation marks and layout whitespace."
+                    "Return every required segment ID exactly once and in order. Never return text. "
+                    "UNKNOWN, CHARACTER, SPEAKER, pronouns, and generic placeholders are invalid speaker labels. "
+                    "Infer a concrete name from context or use one stable descriptive role such as 年轻人, 女孩, 管家, or 病人."
                 )
                 print("Retrying chunk because validation failed...")
                 continue
@@ -419,22 +568,6 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
 
         if attempt < max_retries:
             print("Retrying with lower temperature...")
-
-        # Last resort: extract individual valid entries with regex
-        salvaged_entries = salvage_json_entries(json_text)
-        if salvaged_entries:
-            salvaged_entries, normalized_count = normalize_unsafe_speakers(
-                salvaged_entries, first_person_speaker
-            )
-            if normalized_count:
-                print(f"  Normalized {normalized_count} unsafe speaker label(s) to {first_person_speaker!r}")
-            schema_errors = validate_script_entries(salvaged_entries)
-            fidelity = compare_text_fidelity(chunk, salvaged_entries)
-            if schema_errors or not fidelity.exact:
-                print("Regex-salvaged entries failed schema or text-fidelity validation")
-                continue
-            print(f"Regex-salvaged {len(salvaged_entries)} entries from malformed response")
-            return salvaged_entries
 
     return []
 
@@ -558,7 +691,6 @@ def main():
         None if args.no_first_person_speaker
         else args.first_person_speaker or generation_config.get("first_person_speaker")
     )
-    lossless_fallback = generation_config.get("lossless_fallback", bool(first_person_speaker))
 
     print(f"Connecting to: {base_url}")
     print(f"Using model: {model_name}")
@@ -575,7 +707,7 @@ def main():
     )
 
     # Split into chunks at natural boundaries
-    chunks = split_into_chunks(book_content, max_size=chunk_size)
+    chunks = split_annotation_chunks(book_content, max_size=chunk_size)
     total_chunks = len(chunks)
 
     print(f"Split into {total_chunks} chunks at paragraph/sentence boundaries")
@@ -600,17 +732,6 @@ def main():
             banned_tokens=banned_tokens,
             first_person_speaker=first_person_speaker
         )
-        if not entries and lossless_fallback:
-            fallback_speaker = first_person_speaker or "NARRATOR"
-            entries = build_lossless_fallback_entries(chunk, fallback_speaker)
-            fallback_fidelity = compare_text_fidelity(chunk, entries)
-            if not fallback_fidelity.exact:
-                entries = []
-            else:
-                print(
-                    f"  LLM validation failed; using {len(entries)} lossless "
-                    f"fallback entries as {fallback_speaker}"
-                )
         if not entries:
             failed_chunks.append(i)
         all_entries.extend(entries)

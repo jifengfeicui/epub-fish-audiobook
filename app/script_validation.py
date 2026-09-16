@@ -1,5 +1,6 @@
 """Text-fidelity and schema checks for generated audiobook scripts."""
 
+import re
 from dataclasses import dataclass
 
 
@@ -9,6 +10,7 @@ _INVALID_SPEAKERS = frozenset({
     "CHARACTER", "SPEAKER", "UNKNOWN", "人物", "角色", "说话人",
     "我", "你", "你们", "他", "她", "他们", "她们",
 })
+_GENERIC_SPEAKER = re.compile(r"^(?:VOICE|CHARACTER|SPEAKER|人物|角色|说话人)\s*\d*$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -83,12 +85,34 @@ def validate_script_entries(entries):
             normalized_speaker = speaker.strip()
             if not normalized_speaker:
                 errors.append(f"entry {index}.speaker must not be empty")
-            elif normalized_speaker.upper() in _INVALID_SPEAKERS:
+            elif (
+                normalized_speaker.upper() in _INVALID_SPEAKERS
+                or normalized_speaker.upper().startswith("UNKNOWN")
+                or normalized_speaker.startswith("未知")
+                or _GENERIC_SPEAKER.fullmatch(normalized_speaker)
+            ):
                 errors.append(f"entry {index} uses invalid speaker label: {speaker!r}")
         text = entry.get("text")
         if isinstance(text, str) and not text.strip():
             errors.append(f"entry {index}.text must not be empty")
     return errors
+
+
+def validate_speakers_for_source(entries, source_text):
+    """Keep role labels in the source language so one character is not split into transliterated aliases."""
+    if not re.search(r"[\u3400-\u9fff]", source_text):
+        return []
+    return [
+        f"entry {index} uses a non-Chinese speaker label for Chinese source: {entry.get('speaker')!r}"
+        for index, entry in enumerate(entries, 1)
+        if isinstance(entry, dict)
+        and isinstance(entry.get("speaker"), str)
+        and entry["speaker"] != "NARRATOR"
+        and (
+            not re.search(r"[\u3400-\u9fff]", entry["speaker"])
+            or (re.search(r"[A-Za-z]", entry["speaker"]) and entry["speaker"] not in source_text)
+        )
+    ]
 
 
 def normalize_unsafe_speakers(entries, first_person_speaker):

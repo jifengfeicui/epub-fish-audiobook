@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 
 from sqlalchemy import create_engine, event, select, update
 from sqlalchemy.orm import Session, sessionmaker
@@ -12,6 +13,21 @@ class Database:
     def __init__(self, path: Path):
         self.path = path.resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = (self.path.parent / ".alexandria.lock").open("a+b")
+        if self._lock.tell() == 0:
+            self._lock.write(b"0")
+            self._lock.flush()
+        self._lock.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(self._lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, BlockingIOError) as exc:
+            self._lock.close()
+            raise RuntimeError(f"Alexandria data directory is already in use: {self.path.parent}") from exc
         self.engine = create_engine(
             f"sqlite:///{self.path.as_posix()}",
             connect_args={"check_same_thread": False, "timeout": 30},
@@ -32,6 +48,18 @@ class Database:
 
     def session(self) -> Session:
         return self.sessions()
+
+    def close(self) -> None:
+        self.engine.dispose()
+        if not self._lock.closed:
+            self._lock.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(self._lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._lock.fileno(), fcntl.LOCK_UN)
+            self._lock.close()
 
     def mark_running_interrupted(self) -> list[tuple[str, str]]:
         with self.session() as session, session.begin():

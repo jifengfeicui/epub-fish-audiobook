@@ -37,12 +37,13 @@ def _defaults() -> dict:
     generate_system, generate_user = _prompts(ROOT / "default_prompts.txt")
     review_system, review_user = _prompts(ROOT / "review_prompts.txt")
     return {
-        "llm_base_url": "http://localhost:11434/v1",
+        "llm_base_url": "http://localhost:1234/v1",
         "llm_api_key": "local",
         "llm_model": "local-model",
         "fish_base_url": "https://api.fish.audio",
         "fish_api_key": "",
         "fish_model": "s2.1-pro-free",
+        "fish_workers": 5,
         "generation": {"chunk_size": 3000, "max_tokens": 4096, "review_batch_size": 25},
         "prompts": {
             "system_prompt": generate_system,
@@ -66,7 +67,7 @@ def _seed_voices(repository: Repository) -> None:
     for speaker, voice in raw.get("bindings", {}).items():
         reference_id = voice.get("reference_id")
         if reference_id and reference_id not in seen:
-            voices.append({"reference_id": reference_id, "name": voice.get("name", speaker), "bound_speaker": speaker, "pool_order": len(voices)})
+            voices.append({"reference_id": reference_id, "name": voice.get("name", speaker), "bound_speaker": "NARRATOR" if speaker == "NARRATOR" else None, "pool_order": len(voices)})
             seen.add(reference_id)
     for voice in raw.get("pool", []):
         reference_id = voice.get("reference_id")
@@ -80,33 +81,38 @@ def _seed_voices(repository: Repository) -> None:
 def create_app(data_dir: Path | None = None, *, start_scheduler: bool = True) -> FastAPI:
     storage_root = (data_dir or Path(os.environ.get("ALEXANDRIA_DATA_DIR", ROOT / "data"))).resolve()
     database = Database(storage_root / "alexandria.db")
-    alembic = Config(str(ROOT / "backend" / "alembic.ini"))
-    alembic.set_main_option("script_location", str(ROOT / "backend" / "alembic"))
-    alembic.set_main_option("sqlalchemy.url", f"sqlite:///{database.path.as_posix()}")
-    command.upgrade(alembic, "head")
-    interrupted_jobs = database.mark_running_interrupted()
-    repository = Repository(database, storage_root)
-    repository.seed_settings(_defaults())
-    _seed_voices(repository)
-    broker = EventBroker()
-    repository.event_publisher = broker.publish
-    for job_id, project_id in interrupted_jobs:
-        repository.add_event(job_id, project_id, "job.interrupted", {
-            "status": "interrupted",
-            "error": "Service restarted while the job was running",
-        })
-    executor = StageExecutor(repository, ROOT)
-    runner = PipelineRunner(repository, executor, broker)
-    scheduler = Scheduler(repository, runner)
+    try:
+        alembic = Config(str(ROOT / "backend" / "alembic.ini"))
+        alembic.set_main_option("script_location", str(ROOT / "backend" / "alembic"))
+        alembic.set_main_option("sqlalchemy.url", f"sqlite:///{database.path.as_posix()}")
+        command.upgrade(alembic, "head")
+        repository = Repository(database, storage_root)
+        repository.seed_settings(_defaults())
+        _seed_voices(repository)
+        broker = EventBroker()
+        repository.event_publisher = broker.publish
+        for job_id, project_id in database.mark_running_interrupted():
+            repository.add_event(job_id, project_id, "job.interrupted", {
+                "status": "interrupted",
+                "error": "Service restarted while the job was running",
+            })
+        executor = StageExecutor(repository, ROOT)
+        runner = PipelineRunner(repository, executor, broker)
+        scheduler = Scheduler(repository, runner)
+    except Exception:
+        database.close()
+        raise
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         broker.bind_loop(asyncio.get_running_loop())
         if start_scheduler:
             scheduler.start()
-        yield
-        scheduler.stop()
-        database.engine.dispose()
+        try:
+            yield
+        finally:
+            scheduler.stop()
+            database.close()
 
     application = FastAPI(title="Alexandria Fish Audiobook", version="1.0", lifespan=lifespan)
     application.state.database = database
@@ -136,10 +142,7 @@ def create_app(data_dir: Path | None = None, *, start_scheduler: bool = True) ->
     return application
 
 
-app = create_app()
-
-
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("backend.alexandria.main:app", host=os.environ.get("ALEXANDRIA_HOST", "127.0.0.1"), port=4200, workers=1)
+    uvicorn.run(create_app(), host=os.environ.get("ALEXANDRIA_HOST", "127.0.0.1"), port=4200, workers=1)

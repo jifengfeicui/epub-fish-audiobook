@@ -3,6 +3,7 @@ export type JobStatus = 'queued' | 'running' | 'pausing' | 'paused' | 'interrupt
 export interface Job {
   id: string
   project_id: string
+  type: 'preprocess' | 'render'
   status: JobStatus
   render_start_mode: 'after_review_batch' | 'after_all_reviews'
   release_batch_size: number
@@ -21,7 +22,6 @@ export interface ProjectSettings {
   single_speaker: boolean
   speaker_name: string
   instruct: string
-  workers: number
 }
 
 export interface Project {
@@ -33,8 +33,20 @@ export interface Project {
   chapter_status_counts: Record<string, number>
   created_at: string
   updated_at: string
+  archived_at: string | null
   settings: ProjectSettings
   latest_job: Job | null
+}
+
+export interface Character {
+  speaker: string
+  gender: string
+  personality: string
+  line_count: number
+  importance: number
+  voice_profile_id: string | null
+  voice_name: string
+  user_edited: boolean
 }
 
 export interface Chapter {

@@ -11,11 +11,11 @@ vi.mock('../api/client', () => ({
 describe('ProjectCreateDialog', () => {
   beforeEach(() => upload.mockReset())
 
-  it('defaults new projects to three-chapter review batches', () => {
+  it('creates projects without automatic render controls', () => {
     const wrapper = mount(ProjectCreateDialog)
-    expect((wrapper.get('select').element as HTMLSelectElement).value).toBe('after_review_batch')
-    expect((wrapper.get('input[type="number"]').element as HTMLInputElement).value).toBe('3')
-    expect(wrapper.text()).toContain('分批审校后开始')
+    expect(wrapper.find('select').exists()).toBe(false)
+    expect(wrapper.findAll('input[type="number"]')).toHaveLength(2)
+    expect(wrapper.text()).not.toContain('渲染开始')
   })
 
   it('omits chapter bounds after a number input is cleared', async () => {
@@ -25,10 +25,10 @@ describe('ProjectCreateDialog', () => {
     Object.defineProperty(fileInput.element, 'files', { value: [new File(['epub'], 'book.epub')] })
     await fileInput.trigger('change')
     const numberInputs = wrapper.findAll('input[type="number"]')
-    await numberInputs[1].setValue('2')
+    await numberInputs[0].setValue('2')
+    await numberInputs[0].setValue('')
+    await numberInputs[1].setValue('5')
     await numberInputs[1].setValue('')
-    await numberInputs[2].setValue('5')
-    await numberInputs[2].setValue('')
     await wrapper.get('button.primary').trigger('click')
 
     expect(upload).toHaveBeenCalledOnce()

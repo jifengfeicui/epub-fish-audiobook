@@ -7,17 +7,61 @@ APP_DIR = Path(__file__).resolve().parents[1] / "app"
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
-from generate_script import build_lossless_fallback_entries, split_into_chunks  # noqa: E402
+from generate_script import annotation_response_format, annotations_to_entries, build_lossless_fallback_entries, split_annotation_chunks, split_annotation_segments, split_into_chunks  # noqa: E402
 from review_script import check_text_loss  # noqa: E402
 from script_validation import (  # noqa: E402
     compare_text_fidelity,
     normalize_unsafe_speakers,
     normalize_fidelity_text,
     validate_script_entries,
+    validate_speakers_for_source,
 )
 
 
 class ScriptValidationTests(unittest.TestCase):
+    def test_segment_annotations_preserve_text_and_reject_missing_or_rewritten_segments(self):
+        source = "旁白。\n“你好！”她回答。"
+        segments = split_annotation_segments(source)
+        annotations = [
+            {"segment_id": row["segment_id"], "speaker": "角色" if "你好" in row["text"] else "NARRATOR", "instruct": ""}
+            for row in segments
+        ]
+        entries = annotations_to_entries(segments, annotations)
+        self.assertEqual("".join(row["text"] for row in entries), source)
+        with self.assertRaisesRegex(ValueError, "complete and ordered"):
+            annotations_to_entries(segments, annotations[:-1])
+        rewritten = [dict(row) for row in annotations]
+        rewritten[0]["text"] = "改写"
+        with self.assertRaisesRegex(ValueError, "must not contain text"):
+            annotations_to_entries(segments, rewritten)
+
+        schema = annotation_response_format(segments)["json_schema"]["schema"]
+        self.assertEqual(schema["minItems"], len(segments))
+        self.assertEqual(
+            [item["properties"]["segment_id"]["const"] for item in schema["prefixItems"]],
+            [row["segment_id"] for row in segments],
+        )
+        self.assertTrue(all(item["additionalProperties"] is False for item in schema["prefixItems"]))
+        self.assertEqual(
+            schema["prefixItems"][0]["properties"]["speaker"]["pattern"],
+            r"^(?:NARRATOR|[^A-Za-z]*[\u3400-\u9fff][^A-Za-z]*)$",
+        )
+
+        english_schema = annotation_response_format([
+            {"segment_id": "s0001", "text": "Hello."},
+        ])["json_schema"]["schema"]
+        self.assertEqual(
+            english_schema["prefixItems"][0]["properties"]["speaker"],
+            {"type": "string", "minLength": 1},
+        )
+
+        self.assertEqual("".join(split_annotation_chunks(source, 5)), source)
+
+        dense_source = "。".join(f"短句{i}" for i in range(120)) + "。"
+        dense_chunks = split_annotation_chunks(dense_source, 10_000)
+        self.assertEqual("".join(dense_chunks), dense_source)
+        self.assertTrue(all(len(split_annotation_segments(chunk)) <= 30 for chunk in dense_chunks))
+
     def test_chinese_dialogue_wrappers_and_layout_are_allowed(self):
         source = "林轩皱眉。\n\n“你到底想干什么？”\n他说：“别走。”"
         entries = [
@@ -76,7 +120,7 @@ class ScriptValidationTests(unittest.TestCase):
         self.assertEqual(ratio, 1.0)
 
     def test_placeholder_and_pronoun_speakers_are_rejected(self):
-        for speaker in ("CHARACTER", "你们", "我"):
+        for speaker in ("CHARACTER", "VOICE 2", "角色3", "UNKNOWN VOICE", "未知角色", "你们", "我"):
             with self.subTest(speaker=speaker):
                 errors = validate_script_entries([
                     {"speaker": speaker, "text": "正文。", "instruct": "Neutral voice."},
@@ -90,6 +134,13 @@ class ScriptValidationTests(unittest.TestCase):
         ])
 
         self.assertEqual(errors, [])
+        self.assertEqual(validate_speakers_for_source(errors, "English only."), [])
+        self.assertTrue(validate_speakers_for_source([
+            {"speaker": "CHEN JI", "text": "你好。", "instruct": ""},
+        ], "陳跡說。"))
+        self.assertTrue(validate_speakers_for_source([
+            {"speaker": "C 陳跡", "text": "你好。", "instruct": ""},
+        ], "陳跡說。"))
 
     def test_explicit_first_person_identity_normalizes_unsafe_labels(self):
         entries = [
