@@ -84,4 +84,8 @@ preparer_output/
 
 # Docker persistent data
 data/
+frontend/dist/
+frontend/test-results/
+frontend/playwright-report/
+frontend/*.tsbuildinfo
 

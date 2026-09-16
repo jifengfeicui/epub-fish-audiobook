@@ -12,7 +12,14 @@ TOOLS = Path(__file__).resolve().parents[1] / "tools"
 if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
-from render_book import assign_voices, concat_mp3, inspect_epub, merge_mp3  # noqa: E402
+from render_book import (  # noqa: E402
+    assign_voices,
+    build_parser,
+    concat_mp3,
+    inspect_epub,
+    merge_mp3,
+    release_batches,
+)
 
 
 def make_epub(path: Path) -> None:
@@ -100,6 +107,30 @@ class VoiceAssignmentTests(unittest.TestCase):
             }), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "no voice available"):
                 assign_voices(["NARRATOR", "路人"], config, root / "assignments.json")
+
+
+class ReleaseBatchTests(unittest.TestCase):
+    def test_releases_full_and_short_batches(self):
+        self.assertEqual(release_batches([1, 2, 3, 4, 5], "after_review_batch", 3), [[1, 2, 3], [4, 5]])
+
+    def test_waits_for_all_reviews(self):
+        self.assertEqual(release_batches([1, 2, 3, 4], "after_all_reviews", 3), [[1, 2, 3, 4]])
+
+    def test_validates_release_size(self):
+        with self.assertRaisesRegex(ValueError, "between 1 and 20"):
+            release_batches([1], "after_review_batch", 21)
+
+    def test_render_start_cli_accepts_documented_hyphenated_values(self):
+        args = build_parser().parse_args([
+            "--epub", "book.epub", "--render-start", "after-all-reviews",
+        ])
+        self.assertEqual(args.render_start, "after_all_reviews")
+
+    def test_render_start_cli_keeps_underscore_compatibility(self):
+        args = build_parser().parse_args([
+            "--epub", "book.epub", "--render-start", "after_review_batch",
+        ])
+        self.assertEqual(args.render_start, "after_review_batch")
 
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg is required")

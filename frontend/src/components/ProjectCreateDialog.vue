@@ -1,0 +1,55 @@
+<script setup lang="ts">
+import { ref } from 'vue'
+import { Upload, X } from 'lucide-vue-next'
+import { api } from '../api/client'
+import type { Project } from '../types'
+
+const emit = defineEmits<{ close: []; created: [project: Project] }>()
+const title = ref('')
+const file = ref<File | null>(null)
+const mode = ref('after_review_batch')
+const batchSize = ref(3)
+const fromChapter = ref<number | '' | null>(null)
+const toChapter = ref<number | '' | null>(null)
+const busy = ref(false)
+const error = ref('')
+
+async function submit() {
+  if (!file.value) { error.value = '请选择 EPUB 文件'; return }
+  busy.value = true
+  error.value = ''
+  const form = new FormData()
+  form.append('file', file.value)
+  form.append('title', title.value)
+  form.append('render_start_mode', mode.value)
+  form.append('release_batch_size', String(batchSize.value))
+  if (fromChapter.value !== null && fromChapter.value !== '') form.append('from_chapter', String(fromChapter.value))
+  if (toChapter.value !== null && toChapter.value !== '') form.append('to_chapter', String(toChapter.value))
+  try { emit('created', await api.upload<Project>('/api/v1/projects', form)) }
+  catch (reason) { error.value = (reason as Error).message }
+  finally { busy.value = false }
+}
+</script>
+
+<template>
+  <div class="modal-backdrop" @click.self="emit('close')">
+    <section class="dialog" role="dialog" aria-modal="true" aria-labelledby="new-project-title">
+      <header><div><span class="eyebrow">新建项目</span><h2 id="new-project-title">导入 EPUB</h2></div><button class="icon-button" title="关闭" @click="emit('close')"><X :size="19" /></button></header>
+      <label class="file-drop">
+        <Upload :size="24" />
+        <strong>{{ file?.name || '选择一本 EPUB' }}</strong>
+        <span>源文件保存在项目目录，章节正文写入 SQLite</span>
+        <input type="file" accept=".epub,application/epub+zip" @change="file = ($event.target as HTMLInputElement).files?.[0] || null" />
+      </label>
+      <div class="form-grid">
+        <label class="span-2">项目名称<input v-model="title" placeholder="默认使用文件名" /></label>
+        <label>渲染开始方式<select v-model="mode"><option value="after_review_batch">分批审校后开始</option><option value="after_all_reviews">全书审校后开始</option></select></label>
+        <label>每批章节数<input v-model.number="batchSize" type="number" min="1" max="20" :disabled="mode === 'after_all_reviews'" /></label>
+        <label>起始章节<input v-model.number="fromChapter" type="number" min="1" placeholder="第 1 章" /></label>
+        <label>结束章节<input v-model.number="toChapter" type="number" min="1" placeholder="最后一章" /></label>
+      </div>
+      <p v-if="error" class="form-error">{{ error }}</p>
+      <footer><button class="button secondary" @click="emit('close')">取消</button><button class="button primary" :disabled="busy" @click="submit">{{ busy ? '正在导入...' : '创建项目' }}</button></footer>
+    </section>
+  </div>
+</template>

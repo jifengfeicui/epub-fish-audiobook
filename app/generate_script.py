@@ -499,6 +499,7 @@ def main():
                         help="Ignore any first-person speaker configured in app/config.json.")
     parser.add_argument("--output",
                         help="Write script to this path instead of repository annotated_script.json.")
+    parser.add_argument("--config", help="Load runtime configuration from this JSON file.")
     args = parser.parse_args()
 
     input_file_path = args.input_file_path
@@ -522,7 +523,7 @@ def main():
         return
 
     # Load LLM config
-    config_path = os.path.join(os.path.dirname(__file__), "config.json")
+    config_path = os.path.abspath(args.config) if args.config else os.path.join(os.path.dirname(__file__), "config.json")
     config = {}
     if os.path.exists(config_path):
         try:

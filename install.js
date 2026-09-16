@@ -2,34 +2,19 @@ module.exports = {
   run: [{
     method: "shell.run",
     params: {
-      message: "uv cache clean"
-    }
-  }, {
-    method: "shell.run",
-    params: {
       path: "app",
       message: "python -m venv env"
     }
   }, {
     method: "shell.run",
     params: {
-      venv: "env",
-      path: "app",
+      venv: "app/env",
+      path: ".",
       message: [
-        "uv pip uninstall google-genai",
-        "uv pip install -r requirements.txt",
-        "uv pip install qwen-tts==0.1.1"
+        "uv pip install -r backend/requirements.txt",
+        "npm --prefix frontend install",
+        "npm --prefix frontend run build"
       ]
-    }
-  }, {
-    method: "script.start",
-    params: {
-      uri: "torch.js",
-      params: {
-        path: "app",
-        venv: "env",
-        flashattention: true
-      }
     }
   }, {
     method: "notify",

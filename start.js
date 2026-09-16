@@ -4,9 +4,9 @@ module.exports = {
     {
       method: "shell.run",
       params: {
-        venv: "env",
-        path: "app",
-        message: "python app.py",
+        venv: "app/env",
+        path: ".",
+        message: "python -m backend.alexandria.main",
         on: [{
           // Capture the URL when the server prints it
           event: "/(http:\\/\\/[0-9.:]+)/",

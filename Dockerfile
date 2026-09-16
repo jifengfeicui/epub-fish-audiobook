@@ -1,33 +1,33 @@
-FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
+FROM node:22-alpine AS frontend-build
+
+WORKDIR /build/frontend
+COPY frontend/package*.json ./
+RUN npm install
+COPY frontend/ ./
+RUN npm run build
+
+FROM python:3.12-slim
 
 WORKDIR /alexandria
 
-# Install system dependencies for audio processing
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg libsndfile1 && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
-COPY app/requirements.txt /alexandria/app/requirements.txt
-RUN pip install --no-cache-dir -r app/requirements.txt && \
-    pip install --no-cache-dir qwen-tts==0.1.1
+COPY backend/requirements.txt /alexandria/backend/requirements.txt
+RUN pip install --no-cache-dir -r backend/requirements.txt
 
-# Copy application code
+COPY backend/ /alexandria/backend/
 COPY app/ /alexandria/app/
-COPY default_prompts.txt review_prompts.txt persona_prompts.txt /alexandria/
-COPY builtin_lora/ /alexandria/builtin_lora/
+COPY fish_adapter/ /alexandria/fish_adapter/
+COPY tools/ /alexandria/tools/
+COPY default_prompts.txt review_prompts.txt /alexandria/
+COPY --from=frontend-build /build/frontend/dist /alexandria/frontend/dist
 
-# Create directories for runtime data
-RUN mkdir -p /alexandria/scripts \
-    /alexandria/designed_voices \
-    /alexandria/clone_voices \
-    /alexandria/lora_models \
-    /alexandria/lora_datasets \
-    /alexandria/dataset_builder \
-    /alexandria/app/uploads
+RUN mkdir -p /alexandria/data
 
-# Bind to 0.0.0.0 inside the container
 ENV ALEXANDRIA_HOST=0.0.0.0
+ENV ALEXANDRIA_DATA_DIR=/alexandria/data
 EXPOSE 4200
 
-CMD ["python", "app/app.py"]
+CMD ["python", "-m", "backend.alexandria.main"]

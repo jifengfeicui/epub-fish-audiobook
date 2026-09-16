@@ -7,11 +7,13 @@ import hashlib
 import html
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import zipfile
 from html.parser import HTMLParser
 from pathlib import Path
@@ -345,12 +347,32 @@ def concat_mp3(files: list[Path], output: Path) -> None:
         temp_output.unlink(missing_ok=True)
 
 
+def release_batches(chapter_ids: list[int], mode: str, batch_size: int) -> list[list[int]]:
+    if mode not in ("after_review_batch", "after_all_reviews"):
+        raise ValueError(f"invalid render start mode: {mode}")
+    if not 1 <= batch_size <= 20:
+        raise ValueError("--release-batch-size must be between 1 and 20")
+    if mode == "after_all_reviews":
+        return [chapter_ids] if chapter_ids else []
+    return [chapter_ids[index:index + batch_size] for index in range(0, len(chapter_ids), batch_size)]
+
+
+def render_start_mode(value: str) -> str:
+    normalized = value.replace("-", "_")
+    if normalized not in ("after_review_batch", "after_all_reviews"):
+        raise argparse.ArgumentTypeError(
+            "must be after-review-batch or after-all-reviews"
+        )
+    return normalized
+
+
 def render_book(args: argparse.Namespace) -> int:
     epub = args.epub.resolve()
     if not epub.exists():
         raise ValueError(f"EPUB not found: {epub}")
     if args.workers is not None and args.workers < 1:
         raise ValueError("--workers must be at least 1")
+    release_batches([], args.render_start, args.release_batch_size)
     book_dir = (args.book_dir.resolve() if args.book_dir else ROOT / "books" / epub.stem).resolve()
     chapters_dir = book_dir / "chapters"
     output_dir = book_dir / "output"
@@ -399,59 +421,24 @@ def render_book(args: argparse.Namespace) -> int:
         book_manifest["full_output"] = previous_manifest["full_output"]
     _atomic_json(book_manifest, manifest_path)
     assignment_path = book_dir / "voice_assignments.json"
-    all_speakers: list[str] = []
-    chapter_records: list[dict[str, Any]] = []
+    render_queue: queue.Queue[list[dict[str, Any]] | None] = queue.Queue()
+    render_errors: list[Exception] = []
+    stop_pipeline = threading.Event()
 
-    for chapter in selected:
-        chapter_dir = chapters_dir / f"{chapter['index']:03d}-{_slug(chapter['title'])}"
-        chapter_dir.mkdir(parents=True, exist_ok=True)
-        source_path = chapter_dir / "source.txt"
-        source_hash = _digest(chapter["href"], chapter["title"], chapter["text"])
-        if args.force in {"extract", "all"} or not source_path.exists() or _load_json(chapter_dir / "stage.json", {}).get("source_hash") != source_hash:
-            source_path.write_text(chapter["text"], encoding="utf-8")
-        stage = _load_json(chapter_dir / "stage.json", {})
-        stage.update({"index": chapter["index"], "title": chapter["title"], "href": chapter["href"], "source_hash": source_hash})
-        _atomic_json(stage, chapter_dir / "stage.json")
-        generated = chapter_dir / "generated.json"
-        reviewed = chapter_dir / "reviewed.json"
-        generation_hash = _digest(source_hash, args.first_person_speaker, _file_digest(APP / "config.json"), _file_digest(APP / "generate_script.py"), _file_digest(ROOT / "default_prompts.txt"))
-        if args.force in {"script", "all"} or not generated.exists() or stage.get("generation_hash") != generation_hash:
-            generate_cmd = [sys.executable, str(APP / "generate_script.py"), str(source_path), "--output", str(generated)]
-            generate_cmd += ["--first-person-speaker", args.first_person_speaker] if args.first_person_speaker else ["--no-first-person-speaker"]
-            _run(generate_cmd, f"generate {chapter['index']:03d}")
-            stage["generation_hash"] = generation_hash
-            _atomic_json(stage, chapter_dir / "stage.json")
-        review_hash = _digest(_file_digest(generated), args.first_person_speaker, _file_digest(APP / "config.json"), _file_digest(APP / "review_script.py"), _file_digest(ROOT / "review_prompts.txt"))
-        if args.force in {"review", "all"} or not reviewed.exists() or stage.get("review_hash") != review_hash:
-            review_cmd = [sys.executable, str(APP / "review_script.py"), "--script", str(generated), "--output", str(reviewed), "--source", str(source_path)]
-            review_cmd += ["--first-person-speaker", args.first_person_speaker] if args.first_person_speaker else ["--no-first-person-speaker"]
-            _run(review_cmd, f"review {chapter['index']:03d}")
-            stage["review_hash"] = review_hash
-            _atomic_json(stage, chapter_dir / "stage.json")
-        items = _load_json(reviewed, None)
-        if not isinstance(items, list) or not items:
-            raise ValueError(f"invalid reviewed script for chapter {chapter['index']}")
-        for item in items:
-            if not isinstance(item, dict) or not isinstance(item.get("speaker"), str) or not isinstance(item.get("text"), str) or not item["text"].strip():
-                raise ValueError(f"invalid reviewed entry in chapter {chapter['index']}")
-            if item["speaker"] not in all_speakers:
-                all_speakers.append(item["speaker"])
-        chapter_records.append({"chapter": chapter, "dir": chapter_dir, "reviewed": reviewed, "stage": stage, "items": items})
-
-    assignments = assign_voices(all_speakers, voice_pool, assignment_path)
-    book_dir.mkdir(parents=True, exist_ok=True)
-    for record in chapter_records:
+    def render_record(record: dict[str, Any]) -> None:
         chapter = record["chapter"]
         chapter_dir = record["dir"]
         items = record["items"]
+        speakers = list(dict.fromkeys(item["speaker"] for item in items))
+        assignments = assign_voices(speakers, voice_pool, assignment_path)
         chapter_voices = chapter_dir / "voices.json"
-        _atomic_json({speaker: assignments[speaker] for speaker in sorted({item["speaker"] for item in items})}, chapter_voices)
+        _atomic_json({speaker: assignments[speaker] for speaker in sorted(speakers)}, chapter_voices)
         output = output_dir / f"{chapter['index']:03d}-{_slug(chapter['title'])}.mp3"
         fish_cmd = [sys.executable, str(ADAPTER / "fish_adapter.py"), "--script", str(record["reviewed"]), "--voices", str(chapter_voices), "--config", str(ADAPTER / "config.json"), "--output", str(chapter_dir / "audio")]
         if args.workers is not None:
             fish_cmd += ["--workers", str(args.workers)]
         if args.force in {"audio", "all"}:
-            fish_cmd += ["--only"] + [str(i) for i in range(1, len(items) + 1)]
+            fish_cmd += ["--only"] + [str(index) for index in range(1, len(items) + 1)]
         _run(fish_cmd, f"fish {chapter['index']:03d}")
         audio_manifest = chapter_dir / "audio" / "manifest.json"
         chunk_files = [chapter_dir / "audio" / f"{index:06d}.mp3" for index in range(1, len(items) + 1)]
@@ -466,6 +453,86 @@ def render_book(args: argparse.Namespace) -> int:
                 item["output"] = str(output.relative_to(book_dir))
                 break
         _atomic_json(book_manifest, manifest_path)
+
+    def render_consumer() -> None:
+        try:
+            while True:
+                batch = render_queue.get()
+                if batch is None:
+                    return
+                for record in batch:
+                    if stop_pipeline.is_set():
+                        return
+                    render_record(record)
+        except Exception as exc:
+            render_errors.append(exc)
+            stop_pipeline.set()
+
+    consumer = threading.Thread(target=render_consumer, name="fish-render", daemon=True)
+    consumer.start()
+    reviewed_records: list[dict[str, Any]] = []
+    pending_batch: list[dict[str, Any]] = []
+
+    producer_error: Exception | None = None
+    try:
+        for chapter in selected:
+            if stop_pipeline.is_set():
+                break
+            chapter_dir = chapters_dir / f"{chapter['index']:03d}-{_slug(chapter['title'])}"
+            chapter_dir.mkdir(parents=True, exist_ok=True)
+            source_path = chapter_dir / "source.txt"
+            source_hash = _digest(chapter["href"], chapter["title"], chapter["text"])
+            if args.force in {"extract", "all"} or not source_path.exists() or _load_json(chapter_dir / "stage.json", {}).get("source_hash") != source_hash:
+                source_path.write_text(chapter["text"], encoding="utf-8")
+            stage = _load_json(chapter_dir / "stage.json", {})
+            stage.update({"index": chapter["index"], "title": chapter["title"], "href": chapter["href"], "source_hash": source_hash})
+            _atomic_json(stage, chapter_dir / "stage.json")
+            generated = chapter_dir / "generated.json"
+            reviewed = chapter_dir / "reviewed.json"
+            generation_hash = _digest(source_hash, args.first_person_speaker, _file_digest(APP / "config.json"), _file_digest(APP / "generate_script.py"), _file_digest(ROOT / "default_prompts.txt"))
+            if args.force in {"script", "all"} or not generated.exists() or stage.get("generation_hash") != generation_hash:
+                generate_cmd = [sys.executable, str(APP / "generate_script.py"), str(source_path), "--output", str(generated)]
+                generate_cmd += ["--first-person-speaker", args.first_person_speaker] if args.first_person_speaker else ["--no-first-person-speaker"]
+                _run(generate_cmd, f"generate {chapter['index']:03d}")
+                stage["generation_hash"] = generation_hash
+                _atomic_json(stage, chapter_dir / "stage.json")
+            review_hash = _digest(_file_digest(generated), args.first_person_speaker, _file_digest(APP / "config.json"), _file_digest(APP / "review_script.py"), _file_digest(ROOT / "review_prompts.txt"))
+            if args.force in {"review", "all"} or not reviewed.exists() or stage.get("review_hash") != review_hash:
+                review_cmd = [sys.executable, str(APP / "review_script.py"), "--script", str(generated), "--output", str(reviewed), "--source", str(source_path)]
+                review_cmd += ["--first-person-speaker", args.first_person_speaker] if args.first_person_speaker else ["--no-first-person-speaker"]
+                _run(review_cmd, f"review {chapter['index']:03d}")
+                stage["review_hash"] = review_hash
+                _atomic_json(stage, chapter_dir / "stage.json")
+            items = _load_json(reviewed, None)
+            if not isinstance(items, list) or not items:
+                raise ValueError(f"invalid reviewed script for chapter {chapter['index']}")
+            for item in items:
+                if not isinstance(item, dict) or not isinstance(item.get("speaker"), str) or not isinstance(item.get("text"), str) or not item["text"].strip():
+                    raise ValueError(f"invalid reviewed entry in chapter {chapter['index']}")
+            record = {"chapter": chapter, "dir": chapter_dir, "reviewed": reviewed, "stage": stage, "items": items}
+            reviewed_records.append(record)
+            if args.render_start == "after_review_batch":
+                pending_batch.append(record)
+                if len(pending_batch) == args.release_batch_size:
+                    render_queue.put(pending_batch)
+                    pending_batch = []
+        if render_errors:
+            raise render_errors[0]
+        if not stop_pipeline.is_set():
+            if args.render_start == "after_all_reviews" and reviewed_records:
+                render_queue.put(reviewed_records)
+            elif pending_batch:
+                render_queue.put(pending_batch)
+    except Exception as exc:
+        producer_error = exc
+        stop_pipeline.set()
+    finally:
+        render_queue.put(None)
+        consumer.join()
+    if producer_error:
+        raise producer_error
+    if render_errors:
+        raise render_errors[0]
 
     if len(selected) == len(chapters):
         full_output = output_dir / f"{_slug(epub.stem)}.mp3"
@@ -492,6 +559,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--from-chapter", type=int)
     parser.add_argument("--to-chapter", type=int)
     parser.add_argument("--workers", type=int)
+    parser.add_argument(
+        "--render-start",
+        type=render_start_mode,
+        default="after_review_batch",
+        metavar="after-review-batch|after-all-reviews",
+        help="Start rendering after each review batch (default) or after all reviews.",
+    )
+    parser.add_argument("--release-batch-size", type=int, default=3)
     parser.add_argument("--first-person-speaker")
     parser.add_argument("--list-chapters", action="store_true")
     parser.add_argument("--force", choices=("extract", "script", "review", "audio", "merge", "all"))

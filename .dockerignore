@@ -7,6 +7,7 @@ __pycache__/
 *.pyc
 logs/
 node_modules/
+data/
 *.m4b
 *.mp3
 *.wav

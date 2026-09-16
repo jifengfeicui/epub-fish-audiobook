@@ -245,6 +245,7 @@ def main():
                         help="Canonical identity for a sustained first-person narrator")
     parser.add_argument("--no-first-person-speaker", action="store_true",
                         help="Ignore any first-person speaker configured in app/config.json")
+    parser.add_argument("--config", help="Load runtime configuration from this JSON file")
     args = parser.parse_args()
 
     # Locate annotated_script.json
@@ -273,7 +274,7 @@ def main():
             print(f"Warning: Source file not found: {args.source}")
 
     # Load config
-    config_path = os.path.join(os.path.dirname(__file__), "config.json")
+    config_path = os.path.abspath(args.config) if args.config else os.path.join(os.path.dirname(__file__), "config.json")
     config = {}
     if os.path.exists(config_path):
         try:
