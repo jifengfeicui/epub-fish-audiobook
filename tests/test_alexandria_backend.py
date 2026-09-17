@@ -6,6 +6,7 @@ import time
 import unittest
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 try:
     from backend.alexandria.db.database import Database
@@ -133,7 +134,7 @@ class RepositoryTests(RepositoryTestCase):
     def test_voice_assignment_uses_explicit_choice_and_gender_without_persisting_random_choice(self):
         project = self.project()
         voices = self.repo.replace_voices([
-            {"reference_id": "narrator", "name": "Narrator", "bound_speaker": "NARRATOR", "pool_order": 0, "gender": "female"},
+            {"reference_id": "narrator", "name": "Narrator", "pool_order": 0, "gender": "female"},
             {"reference_id": "a", "name": "A", "pool_order": 1, "gender": "female"},
             {"reference_id": "b", "name": "B", "pool_order": 2, "gender": "male"},
         ])
@@ -144,6 +145,7 @@ class RepositoryTests(RepositoryTestCase):
         ])
         self.repo.refresh_characters(project["id"])
         by_reference = {voice["reference_id"]: voice for voice in voices}
+        self.repo.update_project_voice_pool(project["id"], [], by_reference["narrator"]["id"])
         self.repo.update_characters(project["id"], [
             {"speaker": "Alice", "gender": "female", "personality": "", "voice_profile_id": None},
             {"speaker": "Bob", "gender": "male", "personality": "", "voice_profile_id": by_reference["b"]["id"]},
@@ -155,6 +157,93 @@ class RepositoryTests(RepositoryTestCase):
         self.assertEqual(assigned["Alice"]["reference_id"], "a")
         self.assertEqual(assigned["Bob"]["reference_id"], "b")
         self.assertIsNone(next(item for item in self.repo.list_characters(project["id"]) if item["speaker"] == "Alice")["voice_profile_id"])
+
+    def test_projects_can_choose_different_narrators(self):
+        first = self.project()
+        second = self.project()
+        voices = self.repo.replace_voices([
+            {"reference_id": "a", "name": "A", "pool_order": 0},
+            {"reference_id": "b", "name": "B", "pool_order": 1},
+        ])
+        self.repo.update_project_voice_pool(first["id"], [], voices[0]["id"])
+        self.repo.update_project_voice_pool(second["id"], [], voices[1]["id"])
+
+        self.assertEqual(self.repo.assign_voices(first["id"], ["NARRATOR"])["NARRATOR"]["reference_id"], "a")
+        self.assertEqual(self.repo.assign_voices(second["id"], ["NARRATOR"])["NARRATOR"]["reference_id"], "b")
+
+    def test_disabled_voice_cannot_be_used_and_in_use_disable_is_rejected(self):
+        project = self.project()
+        voices = self.repo.replace_voices([
+            {"reference_id": "narrator", "name": "Narrator", "pool_order": 0},
+            {"reference_id": "a", "name": "A", "pool_order": 1},
+        ])
+        self.repo.update_project_voice_pool(project["id"], [], voices[0]["id"])
+        chapter = self.repo.list_chapters(project["id"])[0]
+        self.repo.save_revision(chapter["id"], "reviewed", [{"speaker": "Alice", "text": "hello", "instruct": ""}])
+        self.repo.refresh_characters(project["id"])
+        self.repo.update_characters(project["id"], [{"speaker": "Alice", "gender": "", "personality": "", "voice_profile_id": voices[1]["id"]}])
+        with self.assertRaisesRegex(RuntimeError, "voice_in_use"):
+            self.repo.replace_voices([
+                {"id": voices[0]["id"], "reference_id": "narrator", "name": "Narrator", "enabled": True},
+                {"id": voices[1]["id"], "reference_id": "a", "name": "A", "enabled": False},
+            ])
+        self.repo.update_characters(project["id"], [{"speaker": "Alice", "gender": "", "personality": "", "voice_profile_id": None}])
+        self.repo.replace_voices([
+            {"id": voices[0]["id"], "reference_id": "narrator", "name": "Narrator", "enabled": True},
+            {"id": voices[1]["id"], "reference_id": "a", "name": "A", "enabled": False},
+        ])
+        with self.assertRaisesRegex(RuntimeError, "No unbound Fish voice available"):
+            self.repo.assign_voices(project["id"], ["Alice"])
+
+    def test_project_voice_pool_rejects_bound_voice_and_filters_random_pool(self):
+        project = self.project()
+        voices = self.repo.replace_voices([
+            {"reference_id": "narrator", "name": "Narrator", "pool_order": 0},
+            {"reference_id": "a", "name": "A", "pool_order": 1},
+            {"reference_id": "b", "name": "B", "pool_order": 2},
+        ])
+        self.repo.update_project_voice_pool(project["id"], [], voices[0]["id"])
+        chapter = self.repo.list_chapters(project["id"])[0]
+        self.repo.save_revision(chapter["id"], "reviewed", [{"speaker": "Alice", "text": "hello", "instruct": ""}])
+        self.repo.refresh_characters(project["id"])
+        self.repo.update_characters(project["id"], [{"speaker": "Alice", "gender": "", "personality": "", "voice_profile_id": voices[1]["id"]}])
+        with self.assertRaisesRegex(RuntimeError, "voice_in_use"):
+            self.repo.update_project_voice_pool(project["id"], [voices[1]["id"]], voices[0]["id"])
+        self.repo.update_characters(project["id"], [{"speaker": "Alice", "gender": "", "personality": "", "voice_profile_id": None}])
+        self.repo.update_project_voice_pool(project["id"], [voices[1]["id"]], voices[0]["id"])
+        assigned = self.repo.assign_voices(project["id"], ["Alice"])
+        self.assertEqual(assigned["Alice"]["reference_id"], "b")
+
+    def test_validate_voice_caches_first_sample_and_allows_new_voice_save(self):
+        class Response:
+            def __init__(self, payload=None, content=b""):
+                self.payload = payload
+                self.content = content
+            def raise_for_status(self):
+                return None
+            def json(self):
+                return self.payload
+
+        responses = iter([
+            Response({
+                "state": "trained",
+                "title": "Demo",
+                "tags": ["female", "young", "zh", "character-voice", "温柔"],
+                "samples": [{"title": "Sample", "text": "Hello", "audio": "https://sample.test/a.wav"}],
+            }),
+            Response(content=b"RIFFsample"),
+        ])
+        with patch("httpx.get", side_effect=lambda *args, **kwargs: next(responses)):
+            result = self.repo.validate_voice("demo-reference", "https://api.fish.audio")
+        self.assertEqual(result["status"], "trained")
+        self.assertEqual(result["gender"], "女")
+        self.assertEqual(result["traits"], "young、温柔")
+        self.assertTrue(result["sample_available"])
+        saved = self.repo.replace_voices([
+            {"reference_id": "demo-reference", "name": "Demo", "pool_order": 0, "enabled": True},
+        ], require_validation=True)
+        self.assertTrue(saved[0]["sample_available"])
+        self.assertEqual(saved[0]["sample_text"], "Hello")
 
     def test_character_importance_sort_and_automated_updates_preserve_manual_metadata(self):
         project = self.project()
@@ -202,6 +291,21 @@ class RepositoryTests(RepositoryTestCase):
         with self.assertRaisesRegex(RuntimeError, "script_not_editable"):
             self.repo.edit_script(chapter["id"], script["revision"], script["entries"])
 
+    def test_updating_chapter_audio_invalidates_book_artifact(self):
+        project = self.project(1)
+        chapter = self.repo.list_chapters(project["id"])[0]
+        output = self.repo.storage_root / "projects" / project["id"] / "output"
+        output.mkdir(parents=True)
+        book = output / "book.mp3"
+        book.write_bytes(b"book")
+        chapter_audio = output / "chapter.mp3"
+        chapter_audio.write_bytes(b"chapter")
+        self.repo.save_artifact(project["id"], None, "book_mp3", book)
+
+        self.repo.save_artifact(project["id"], chapter["id"], "chapter_mp3", chapter_audio)
+
+        self.assertEqual([row["kind"] for row in self.repo.list_artifacts(project["id"])], ["chapter_mp3"])
+
 
 class FakeExecutor:
     def __init__(self, repo: Repository):
@@ -233,7 +337,7 @@ class FakeExecutor:
             self.overlapped = self.render_one_started.wait(1)
         return self.repo.save_revision(chapter_id, "reviewed", generated["entries"], self.review_input_hash(generated, project))
 
-    def render(self, chapter_id, project, log):
+    def render(self, chapter_id, project, log, should_stop=lambda: False):
         self.rendered.append(chapter_id)
         chapter = self.repo.get_chapter_record(chapter_id)
         if chapter.position == 1:
@@ -303,6 +407,59 @@ class PipelineTests(RepositoryTestCase):
         self.assertEqual(executor.merged, 1)
         self.assertEqual(self.repo.get_job(render["id"])["status"], "completed")
 
+    def test_partial_render_does_not_merge_book(self):
+        project = self.project(2)
+        self.repo.update_project(project["id"], {"from_chapter": 1, "to_chapter": 1})
+        for chapter in self.repo.list_chapters(project["id"]):
+            self.repo.save_revision(chapter["id"], "reviewed", [{"speaker": "NARRATOR", "text": "text", "instruct": ""}])
+        job = self.repo.create_job(project["id"], "render")
+        executor = FakeExecutor(self.repo)
+
+        PipelineRunner(self.repo, executor, EventBroker()).run(job["id"])
+
+        self.assertEqual(executor.rendered, [self.repo.list_chapters(project["id"])[0]["id"]])
+        self.assertEqual(executor.merged, 0)
+
+    def test_merge_job_requires_all_chapter_audio_and_merges_all_chapters(self):
+        project = self.project(2)
+        with self.assertRaisesRegex(RuntimeError, "merge_not_ready"):
+            self.repo.create_job(project["id"], "merge")
+        chapters = self.repo.list_chapters(project["id"])
+        for chapter in chapters:
+            path = self.repo.storage_root / "projects" / project["id"] / "output" / f"{chapter['position']}.mp3"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"mp3")
+            self.repo.save_artifact(project["id"], chapter["id"], "chapter_mp3", path)
+
+        job = self.repo.create_job(project["id"], "merge")
+        executor = FakeExecutor(self.repo)
+        PipelineRunner(self.repo, executor, EventBroker()).run(job["id"])
+
+        self.assertEqual(executor.rendered, [])
+        self.assertEqual(executor.merged, 1)
+        self.assertEqual(self.repo.get_job(job["id"])["status"], "completed")
+
+    def test_merge_book_ignores_selected_tts_range(self):
+        project = self.project(2)
+        self.repo.update_project(project["id"], {"from_chapter": 2, "to_chapter": 2})
+        expected = []
+        for chapter in self.repo.list_chapters(project["id"]):
+            path = self.repo.storage_root / "projects" / project["id"] / "output" / f"{chapter['position']}.mp3"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"mp3")
+            expected.append(path)
+            self.repo.save_artifact(project["id"], chapter["id"], "chapter_mp3", path)
+        merged_files = []
+
+        def concat(files, output):
+            merged_files.extend(files)
+            output.write_bytes(b"book")
+
+        with patch("tools.render_book.concat_mp3", concat):
+            StageExecutor(self.repo, Path(__file__).parents[1]).merge_book(project, lambda _message: None)
+
+        self.assertEqual(merged_files, expected)
+
     def test_render_requires_every_selected_chapter_to_be_preprocessed(self):
         project = self.project(2)
         chapter = self.repo.list_chapters(project["id"])[0]
@@ -327,6 +484,136 @@ class PipelineTests(RepositoryTestCase):
         chapter_id = self.repo.list_chapters(project["id"])[0]["id"]
         self.assertIsNone(self.repo.latest_revision(chapter_id, "reviewed"))
         self.assertEqual(self.repo.get_job(job["id"])["status"], "paused")
+
+    def test_render_stop_discards_in_flight_results_and_stops_submitting(self):
+        from fish_adapter.renderer import FishRenderer, RenderResult
+
+        project = self.project(1)
+        chapter = self.repo.list_chapters(project["id"])[0]
+        self.repo.save_revision(chapter["id"], "reviewed", [
+            {"speaker": "NARRATOR", "text": f"line {index}", "instruct": ""}
+            for index in range(8)
+        ])
+        voices = self.repo.replace_voices([{
+            "reference_id": "narrator",
+            "name": "Narrator",
+            "pool_order": 0,
+        }])
+        self.repo.update_project_voice_pool(project["id"], [], voices[0]["id"])
+        self.repo.update_settings({"fish_api_key": "secret", "fish_workers": 2})
+        executor = StageExecutor(self.repo, Path(__file__).parents[1])
+        stop = threading.Event()
+        release = threading.Event()
+        both_started = threading.Event()
+        all_returned = threading.Event()
+        calls = 0
+        returned = 0
+        lock = threading.Lock()
+
+        def blocked_synthesize(_renderer, _text, _voice):
+            nonlocal calls, returned
+            with lock:
+                calls += 1
+                if calls == 2:
+                    both_started.set()
+            release.wait(2)
+            with lock:
+                returned += 1
+                if returned == 2:
+                    all_returned.set()
+            return RenderResult(audio=b"mp3", attempts=1)
+
+        errors = []
+        with patch.object(FishRenderer, "synthesize", blocked_synthesize):
+            thread = threading.Thread(
+                target=lambda: self._capture_error(
+                    errors,
+                    lambda: executor.render(chapter["id"], project, lambda _message: None, stop.is_set),
+                )
+            )
+            thread.start()
+            self.assertTrue(both_started.wait(2))
+            stop.set()
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+            release.set()
+            self.assertTrue(all_returned.wait(2))
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], StageCancelled)
+        with self.database.session() as session:
+            self.assertEqual(session.query(AudioSegment).count(), 0)
+        self.assertEqual(list((self.repo.storage_root / "projects" / project["id"] / "audio").rglob("*.mp3")), [])
+
+    def test_render_stop_during_write_removes_audio(self):
+        from fish_adapter.renderer import FishRenderer, RenderResult
+
+        project = self.project(1)
+        chapter = self.repo.list_chapters(project["id"])[0]
+        self.repo.save_revision(chapter["id"], "reviewed", [{"speaker": "NARRATOR", "text": "line", "instruct": ""}])
+        voices = self.repo.replace_voices([{
+            "reference_id": "narrator",
+            "name": "Narrator",
+            "pool_order": 0,
+        }])
+        self.repo.update_project_voice_pool(project["id"], [], voices[0]["id"])
+        self.repo.update_settings({"fish_api_key": "secret", "fish_workers": 1})
+        stop = threading.Event()
+
+        def write_then_stop(path, audio):
+            path.write_bytes(audio)
+            stop.set()
+
+        with (
+            patch.object(FishRenderer, "synthesize", return_value=RenderResult(audio=b"mp3", attempts=1)),
+            patch("fish_adapter.fish_adapter._write_audio_atomic", write_then_stop),
+            self.assertRaises(StageCancelled),
+        ):
+            StageExecutor(self.repo, Path(__file__).parents[1]).render(
+                chapter["id"], project, lambda _message: None, stop.is_set
+            )
+
+        with self.database.session() as session:
+            self.assertEqual(session.query(AudioSegment).count(), 0)
+        self.assertEqual(list((self.repo.storage_root / "projects" / project["id"] / "audio").rglob("*.mp3")), [])
+
+    def test_paused_and_cancelled_render_mark_stage_interrupted_and_chapter_reviewed(self):
+        for stop_method, expected_status in (("request_pause", "paused"), ("cancel_job", "cancelled")):
+            with self.subTest(stop_method=stop_method):
+                project = self.project(1)
+                chapter = self.repo.list_chapters(project["id"])[0]
+                self.repo.save_revision(chapter["id"], "reviewed", [{"speaker": "NARRATOR", "text": "text", "instruct": ""}])
+                job = self.repo.create_job(project["id"], "render")
+                executor = FakeExecutor(self.repo)
+                started = threading.Event()
+
+                def render_until_stopped(_chapter_id, _project, _log, should_stop=lambda: False):
+                    started.set()
+                    while not should_stop():
+                        time.sleep(0.01)
+                    raise StageCancelled("Stage cancelled")
+
+                executor.render = render_until_stopped
+                thread = threading.Thread(target=PipelineRunner(self.repo, executor, EventBroker()).run, args=(job["id"],))
+                thread.start()
+                self.assertTrue(started.wait(2))
+                getattr(self.repo, stop_method)(job["id"])
+                thread.join(2)
+
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(self.repo.get_job(job["id"])["status"], expected_status)
+                self.assertEqual(self.repo.list_chapters(project["id"])[0]["status"], "reviewed")
+                with self.database.session() as session:
+                    stage = session.query(StageRun).filter_by(job_id=job["id"]).one()
+                    self.assertEqual(stage.status, "interrupted")
+
+    @staticmethod
+    def _capture_error(errors, callback):
+        try:
+            callback()
+        except Exception as exc:
+            errors.append(exc)
 
 
 if __name__ == "__main__":

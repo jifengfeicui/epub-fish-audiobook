@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field, field_validator
 
 
 RenderStartMode = Literal["after_review_batch", "after_all_reviews"]
-JobType = Literal["preprocess", "render"]
+JobType = Literal["preprocess", "render", "merge"]
 
 
 class ProjectUpdate(BaseModel):
@@ -70,14 +70,23 @@ class VoiceInput(BaseModel):
     id: Optional[str] = None
     reference_id: str = Field(min_length=1, max_length=100)
     name: str = Field(min_length=1, max_length=300)
-    bound_speaker: Optional[str] = Field(default=None, max_length=200)
     pool_order: int = Field(default=0, ge=0)
     gender: str = Field(default="", max_length=100)
     traits: str = Field(default="", max_length=1000)
+    enabled: bool = True
 
 
 class VoiceListUpdate(BaseModel):
     voices: list[VoiceInput]
+
+
+class VoiceValidationInput(BaseModel):
+    reference_id: str = Field(min_length=1, max_length=100)
+
+
+class ProjectVoicePoolUpdate(BaseModel):
+    excluded_voice_ids: list[str] = Field(default_factory=list)
+    narrator_voice_profile_id: Optional[str] = Field(default=None, max_length=36)
 
 
 class CharacterInput(BaseModel):

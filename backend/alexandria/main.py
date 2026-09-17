@@ -67,12 +67,12 @@ def _seed_voices(repository: Repository) -> None:
     for speaker, voice in raw.get("bindings", {}).items():
         reference_id = voice.get("reference_id")
         if reference_id and reference_id not in seen:
-            voices.append({"reference_id": reference_id, "name": voice.get("name", speaker), "bound_speaker": "NARRATOR" if speaker == "NARRATOR" else None, "pool_order": len(voices)})
+            voices.append({"reference_id": reference_id, "name": voice.get("name", speaker), "pool_order": len(voices)})
             seen.add(reference_id)
     for voice in raw.get("pool", []):
         reference_id = voice.get("reference_id")
         if reference_id and reference_id not in seen:
-            voices.append({"reference_id": reference_id, "name": voice.get("name", reference_id), "bound_speaker": None, "pool_order": len(voices)})
+            voices.append({"reference_id": reference_id, "name": voice.get("name", reference_id), "pool_order": len(voices)})
             seen.add(reference_id)
     if voices:
         repository.replace_voices(voices)

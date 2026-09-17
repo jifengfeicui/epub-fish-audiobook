@@ -11,7 +11,7 @@ const settings = {
 test('paginates settings, retains edits, and saves voice gender radio', async ({ page }) => {
   let savedSettings: typeof settings | undefined
   let savedVoices: unknown
-  const voices = [{ id: 'voice-1', reference_id: 'ref-1', name: '旁白音色', bound_speaker: 'NARRATOR', pool_order: 0, gender: '', traits: '沉稳' }]
+  const voices = [{ id: 'voice-1', reference_id: 'ref-1', name: '音色一', pool_order: 0, gender: '', traits: '沉稳' }]
 
   await page.route('**/api/v1/settings', async route => {
     if (route.request().method() === 'PUT') savedSettings = route.request().postDataJSON()
@@ -47,4 +47,37 @@ test('paginates settings, retains edits, and saves voice gender radio', async ({
   await page.setViewportSize({ width: 390, height: 844 })
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true)
   await expect(nav).toHaveCSS('display', 'flex')
+})
+
+test('adds a voice from only its Fish id without rendering sample text', async ({ page }) => {
+  const voices = [{ id: 'voice-1', reference_id: 'existing', name: '已有音色', pool_order: 0, gender: '', traits: '', enabled: true }]
+  let validationCalls = 0
+
+  await page.route('**/api/v1/settings', route => route.fulfill({ json: settings }))
+  await page.route('**/api/v1/voices', route => route.fulfill({ json: voices }))
+  await page.route('**/api/v1/voices/validate', async route => {
+    validationCalls += 1
+    await route.fulfill({ json: {
+      reference_id: 'new-reference', name: '自动名称', gender: '女', traits: 'young、温柔',
+      sample_available: true, sample_reference_id: 'new-reference', sample_title: '不应显示的标题',
+      sample_text: '不应显示的示例文字', sample_url: '/sample.wav',
+    } })
+  })
+
+  await page.goto('/settings')
+  await page.getByRole('navigation', { name: '配置分类' }).getByRole('button', { name: '音色池' }).click()
+  await page.getByRole('button', { name: '添加音色' }).click()
+  await page.getByLabel('Fish Reference ID').fill('existing')
+  await page.getByRole('button', { name: '校验并添加' }).click()
+  await expect(page.getByText('该音色已在音色池中')).toBeVisible()
+  expect(validationCalls).toBe(0)
+
+  await page.getByLabel('Fish Reference ID').fill('new-reference')
+  await page.getByRole('button', { name: '校验并添加' }).click()
+  await expect(page.getByRole('dialog')).toBeHidden()
+  const addedRow = page.locator('.voice-row').last()
+  await expect(addedRow.locator(':scope > input').nth(0)).toHaveValue('自动名称')
+  await expect(addedRow.locator(':scope > input').nth(1)).toHaveValue('young、温柔')
+  await expect(page.getByText('不应显示的示例文字')).toHaveCount(0)
+  await expect(page.locator('button[title="播放示例"]:not([disabled])')).toHaveCount(1)
 })

@@ -25,7 +25,9 @@ class PipelineRunner:
             return
         project = self.repo.get_project(job["project_id"])
         try:
-            if job["type"] == "render":
+            if job["type"] == "merge":
+                self._merge(job, project)
+            elif job["type"] == "render":
                 self._render(job, project)
             else:
                 self._preprocess(job, project)
@@ -109,7 +111,8 @@ class PipelineRunner:
         self._event(job, "characters.completed", {"count": len(self.repo.list_characters(project["id"]))})
 
     def _render(self, job: dict[str, Any], project: dict[str, Any]) -> None:
-        for chapter_data in self.repo.list_selected_chapters(project["id"]):
+        chapters = self.repo.list_selected_chapters(project["id"])
+        for chapter_data in chapters:
             if self.repo.is_stop_requested(job["id"]):
                 raise StageCancelled("Stage cancelled")
             chapter_id = chapter_data["id"]
@@ -117,12 +120,28 @@ class PipelineRunner:
             self.repo.update_stage(job["id"], chapter_id, "render", "running")
             self.repo.update_chapter_status(chapter_id, "rendering")
             try:
-                output = self.executor.render(chapter_id, project, lambda message: self._log(job, "tts", message))
+                output = self.executor.render(
+                    chapter_id,
+                    project,
+                    lambda message: self._log(job, "tts", message),
+                    lambda: self.repo.is_stop_requested(job["id"]),
+                )
+                if self.repo.is_stop_requested(job["id"]):
+                    raise StageCancelled("Stage cancelled")
             except Exception as exc:
-                self.repo.update_stage(job["id"], chapter_id, "render", "failed", error=str(exc))
-                self.repo.update_chapter_status(chapter_id, "failed")
+                if isinstance(exc, StageCancelled):
+                    self.repo.update_stage(job["id"], chapter_id, "render", "interrupted", error=str(exc))
+                    self.repo.update_chapter_status(chapter_id, "reviewed")
+                else:
+                    self.repo.update_stage(job["id"], chapter_id, "render", "failed", error=str(exc))
+                    self.repo.update_chapter_status(chapter_id, "failed")
                 raise
             self.repo.update_stage(job["id"], chapter_id, "render", "completed")
             self.repo.update_chapter_status(chapter_id, "done")
             self._event(job, "chapter.rendered", {"chapter_id": chapter_id, "position": chapter.position, "output": str(output)})
-        self.executor.merge_book(project, lambda message: self._log(job, "merge", message))
+        if len(chapters) == project["chapter_count"]:
+            self._merge(job, project)
+
+    def _merge(self, job: dict[str, Any], project: dict[str, Any]) -> None:
+        output = self.executor.merge_book(project, lambda message: self._log(job, "merge", message))
+        self._event(job, "book.merged", {"output": str(output)})

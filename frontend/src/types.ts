@@ -3,7 +3,7 @@ export type JobStatus = 'queued' | 'running' | 'pausing' | 'paused' | 'interrupt
 export interface Job {
   id: string
   project_id: string
-  type: 'preprocess' | 'render'
+  type: 'preprocess' | 'render' | 'merge'
   status: JobStatus
   render_start_mode: 'after_review_batch' | 'after_all_reviews'
   release_batch_size: number

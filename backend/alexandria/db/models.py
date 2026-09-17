@@ -108,6 +108,20 @@ class VoiceProfile(Base):
     pool_order: Mapped[int] = mapped_column(Integer, default=0)
     gender: Mapped[str] = mapped_column(String(100), default="")
     traits: Mapped[str] = mapped_column(Text, default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    sample_path: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
+    sample_reference_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    sample_title: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    sample_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+class ProjectVoiceExclusion(Base):
+    __tablename__ = "project_voice_exclusions"
+    __table_args__ = (UniqueConstraint("project_id", "voice_profile_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    voice_profile_id: Mapped[str] = mapped_column(ForeignKey("voice_profiles.id", ondelete="CASCADE"), index=True)
 
 
 class SpeakerAssignment(Base):

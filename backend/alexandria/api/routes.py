@@ -8,7 +8,7 @@ import aiofiles
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 
-from backend.alexandria.api.schemas import CharacterListUpdate, JobCreate, ProjectUpdate, ScriptUpdate, SettingsUpdate, VoiceListUpdate
+from backend.alexandria.api.schemas import CharacterListUpdate, JobCreate, ProjectUpdate, ProjectVoicePoolUpdate, ScriptUpdate, SettingsUpdate, VoiceListUpdate, VoiceValidationInput
 from backend.alexandria.db.repository import Repository
 from backend.alexandria.domain.pipeline import RENDER_START_MODES
 
@@ -34,8 +34,18 @@ def _http_error(exc: Exception) -> HTTPException:
         "invalid_chapter_range": (422, "The selected chapter range is invalid"),
         "voice_in_use": (409, "This voice is assigned to a project and cannot be removed"),
         "render_not_ready": (409, "All selected chapters must finish preprocessing before TTS can start"),
+        "merge_not_ready": (409, "Every chapter must have valid audio before the book can be merged"),
+        "voice_not_usable": (422, "Fish reference_id is not a trained voice with a sample"),
+        "voice_sample_missing": (422, "Fish voice has no downloadable sample"),
+        "voice_sample_empty": (422, "Fish returned an empty voice sample"),
+        "narrator_voice_required": (409, "Select a narrator voice in project settings before starting TTS"),
+        "narrator_voice_unavailable": (409, "The project narrator must be an enabled voice in the project pool"),
     }
-    status, detail = mapping.get(str(exc), (400, str(exc)))
+    message = str(exc)
+    key = next((item for item in mapping if message == item or message.startswith(f"{item}:")), None)
+    status, detail = mapping.get(key, (400, message))
+    if key and message != key:
+        detail = f"{detail}: {message.split(':', 1)[1].strip()}"
     return HTTPException(status_code=status, detail=detail)
 
 
@@ -225,6 +235,18 @@ def list_artifacts(project_id: str, request: Request):
     return _repo(request).list_artifacts(project_id)
 
 
+@router.get("/artifacts/{artifact_id}/play")
+def play_artifact(artifact_id: str, request: Request):
+    repository = _repo(request)
+    try:
+        _artifact, path = repository.get_artifact(artifact_id)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+    if repository.storage_root not in path.parents or not path.is_file():
+        raise HTTPException(status_code=404, detail="Artifact file not found")
+    return FileResponse(path, media_type="audio/mpeg", content_disposition_type="inline")
+
+
 @router.get("/projects/{project_id}/speaker-assignments")
 def list_speaker_assignments(project_id: str, request: Request):
     try:
@@ -287,7 +309,54 @@ def list_voices(request: Request):
 @router.put("/voices")
 def replace_voices(payload: VoiceListUpdate, request: Request):
     try:
-        return _repo(request).replace_voices([voice.model_dump() for voice in payload.voices])
+        repository = _repo(request)
+        return repository.replace_voices([voice.model_dump() for voice in payload.voices], require_validation=True)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/voices/validate")
+def validate_voice(payload: VoiceValidationInput, request: Request):
+    repository = _repo(request)
+    settings = repository.get_settings(reveal_secrets=True)
+    try:
+        return repository.validate_voice(payload.reference_id, settings.get("fish_base_url", "https://api.fish.audio"))
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/voices/{voice_id}/sample")
+def voice_sample(voice_id: str, request: Request):
+    try:
+        return FileResponse(_repo(request).get_voice_sample(voice_id), media_type="audio/wav", content_disposition_type="inline")
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/voices/previews/{token}")
+def voice_preview(token: str, request: Request):
+    try:
+        return FileResponse(_repo(request).get_voice_preview(token), media_type="audio/wav", content_disposition_type="inline")
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/projects/{project_id}/voice-pool")
+def get_project_voice_pool(project_id: str, request: Request):
+    try:
+        return _repo(request).get_project_voice_pool(project_id)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.put("/projects/{project_id}/voice-pool")
+def update_project_voice_pool(project_id: str, payload: ProjectVoicePoolUpdate, request: Request):
+    try:
+        return _repo(request).update_project_voice_pool(
+            project_id,
+            payload.excluded_voice_ids,
+            payload.narrator_voice_profile_id,
+        )
     except Exception as exc:
         raise _http_error(exc) from exc
 

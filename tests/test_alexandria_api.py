@@ -37,6 +37,25 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.client.put("/api/v1/settings", json={"fish_workers": 0}).status_code, 422)
         self.assertEqual(self.client.put("/api/v1/settings", json={"fish_workers": 17}).status_code, 422)
 
+    def test_voice_pool_endpoint_and_enabled_voice_shape(self):
+        voices = self.client.get("/api/v1/voices")
+        self.assertEqual(voices.status_code, 200)
+        self.assertIn("enabled", voices.json()[0])
+        source = "第1章\n正文"
+        created = self.client.post(
+            "/api/v1/projects",
+            files={"file": ("book.txt", BytesIO(source.encode("utf-8")), "text/plain")},
+        )
+        self.assertEqual(created.status_code, 201)
+        project_id = created.json()["id"]
+        pool = self.client.get(f"/api/v1/projects/{project_id}/voice-pool")
+        self.assertEqual(pool.status_code, 200)
+        self.assertEqual(pool.json(), {"excluded_voice_ids": [], "narrator_voice_profile_id": None})
+        self.assertEqual(
+            self.client.put(f"/api/v1/projects/{project_id}/voice-pool", json={"excluded_voice_ids": [], "narrator_voice_profile_id": None}).status_code,
+            200,
+        )
+
     def test_job_types_render_gate_and_reparse(self):
         source = "第1章歸零\n正文\n第2章親戚\n正文"
         created = self.client.post(
@@ -48,6 +67,10 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(len(self.client.get(f"/api/v1/projects/{project_id}/chapters").json()), 2)
         self.assertEqual(
             self.client.post(f"/api/v1/projects/{project_id}/jobs", json={"type": "render"}).status_code,
+            409,
+        )
+        self.assertEqual(
+            self.client.post(f"/api/v1/projects/{project_id}/jobs", json={"type": "merge"}).status_code,
             409,
         )
         job = self.client.post(f"/api/v1/projects/{project_id}/jobs", json={"type": "preprocess"})

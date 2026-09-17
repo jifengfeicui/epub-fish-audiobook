@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Callable
 
@@ -298,7 +298,13 @@ class StageExecutor:
             updates.append({"speaker": row["speaker"], "gender": gender, "personality": personality})
         return self.repo.update_characters(project["id"], updates, automated=True)
 
-    def render(self, chapter_id: int, project: dict[str, Any], log: LogCallback) -> Path:
+    def render(
+        self,
+        chapter_id: int,
+        project: dict[str, Any],
+        log: LogCallback,
+        should_stop: Callable[[], bool] = lambda: False,
+    ) -> Path:
         from fish_adapter.cache import fingerprint_entry
         from fish_adapter.emotion_mapper import build_fish_text
         from fish_adapter.fish_adapter import DEFAULT_CONFIG, _write_audio_atomic
@@ -323,8 +329,14 @@ class StageExecutor:
         audio_dir = self.repo.storage_root / "projects" / project["id"] / "audio" / f"{chapter.position:04d}"
         audio_dir.mkdir(parents=True, exist_ok=True)
         renderer = FishRenderer(config, api_key)
+        aborted = threading.Event()
+
+        def check_stop() -> None:
+            if aborted.is_set() or should_stop():
+                raise StageCancelled("Stage cancelled")
 
         def synthesize(entry: dict[str, Any]) -> tuple[int, Path, str, int]:
+            check_stop()
             position = int(entry["position"])
             voice_id = voices[entry["speaker"]]["reference_id"]
             fingerprint = fingerprint_entry(entry, voice_id, config["api"]["model"], config["tts"])
@@ -332,11 +344,19 @@ class StageExecutor:
             output = self.repo.storage_root / relative
             reusable = self.repo.reusable_audio_segment(chapter_id, position, fingerprint)
             if reusable:
+                check_stop()
                 log(f"第 {chapter.position} 章片段 {position} 使用缓存")
                 return position, self.repo.storage_root / reusable, fingerprint, 0
             try:
+                check_stop()
                 result = renderer.synthesize(build_fish_text(entry["text"], entry.get("instruct", "")), voice_id)
+                check_stop()
                 _write_audio_atomic(output, result.audio)
+                try:
+                    check_stop()
+                except StageCancelled:
+                    output.unlink(missing_ok=True)
+                    raise
                 self.repo.save_audio_segment(
                     project_id=project["id"],
                     chapter_id=chapter_id,
@@ -347,7 +367,10 @@ class StageExecutor:
                     status="done",
                     attempts=result.attempts,
                 )
+            except StageCancelled:
+                raise
             except Exception as exc:
+                check_stop()
                 self.repo.save_audio_segment(
                     project_id=project["id"],
                     chapter_id=chapter_id,
@@ -360,17 +383,44 @@ class StageExecutor:
                     error=str(exc),
                 )
                 raise
+            check_stop()
             log(f"第 {chapter.position} 章片段 {position} 已渲染")
             return position, output, fingerprint, result.attempts
 
         files: dict[int, Path] = {}
         workers = max(1, min(int(settings.get("fish_workers", 5)), 16))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(synthesize, entry) for entry in script["entries"]]
-            for future in as_completed(futures):
-                position, path, _fingerprint, _attempts = future.result()
-                files[position] = path
+        entries = iter(script["entries"])
+        pool = ThreadPoolExecutor(max_workers=workers)
+        pending = set()
+        try:
+            for _ in range(workers):
+                check_stop()
+                entry = next(entries, None)
+                if entry is None:
+                    break
+                pending.add(pool.submit(synthesize, entry))
 
+            while pending:
+                check_stop()
+                done, _ = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+                for future in done:
+                    pending.remove(future)
+                    position, path, _fingerprint, _attempts = future.result()
+                    files[position] = path
+                    check_stop()
+                    entry = next(entries, None)
+                    if entry is not None:
+                        pending.add(pool.submit(synthesize, entry))
+        except Exception:
+            aborted.set()
+            for future in pending:
+                future.cancel()
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            pool.shutdown()
+
+        check_stop()
         ordered_entries = sorted(script["entries"], key=lambda row: row["position"])
         chapter_output = self.repo.storage_root / "projects" / project["id"] / "output" / f"{chapter.position:04d}-{_slug(chapter.title)}.mp3"
         merge_mp3(
@@ -384,10 +434,16 @@ class StageExecutor:
     def merge_book(self, project: dict[str, Any], log: LogCallback) -> Path:
         from tools.render_book import concat_mp3
 
-        chapters = self.repo.list_selected_chapters(project["id"])
+        chapters = self.repo.list_chapters(project["id"])
         artifacts = self.repo.list_artifacts(project["id"])
         by_chapter = {row["chapter_id"]: self.repo.storage_root / row["path"] for row in artifacts if row["kind"] == "chapter_mp3"}
-        missing = [chapter["position"] for chapter in chapters if chapter["id"] not in by_chapter]
+        missing = [
+            chapter["position"]
+            for chapter in chapters
+            if chapter["id"] not in by_chapter
+            or not by_chapter[chapter["id"]].is_file()
+            or not by_chapter[chapter["id"]].stat().st_size
+        ]
         if missing:
             raise RuntimeError(f"Cannot merge book; missing chapter audio: {missing}")
         output_dir = self.repo.storage_root / "projects" / project["id"] / "output"

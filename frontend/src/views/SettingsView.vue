@@ -1,16 +1,22 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
-import { KeyRound, MessageSquareText, Mic2, Plus, Save, Server, SlidersHorizontal, Trash2 } from 'lucide-vue-next'
+import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { CircleCheck, KeyRound, LoaderCircle, MessageSquareText, Mic2, Play, Plus, Save, Server, SlidersHorizontal, Trash2, X } from 'lucide-vue-next'
 import { api } from '../api/client'
 
 interface VoiceProfile {
   id?: string
   reference_id: string
   name: string
-  bound_speaker: string | null
   pool_order: number
   gender: string
   traits: string
+  enabled: boolean
+  sample_available?: boolean
+  sample_reference_id?: string | null
+  sample_title?: string | null
+  sample_text?: string | null
+  sample_url?: string | null
+  validating?: boolean
 }
 
 interface AppSettings {
@@ -47,6 +53,11 @@ const voices = ref<VoiceProfile[]>([])
 const saved = ref(false)
 const error = ref('')
 const activeSection = ref<'connections' | 'rendering' | 'prompts' | 'voices'>('connections')
+const showAddVoice = ref(false)
+const newReferenceId = ref('')
+const addVoiceError = ref('')
+const addingVoice = ref(false)
+let previewAudio: HTMLAudioElement | null = null
 
 onMounted(async () => {
   const [settings, profiles] = await Promise.all([
@@ -54,14 +65,73 @@ onMounted(async () => {
     api.get<VoiceProfile[]>('/api/v1/voices'),
   ])
   form.value = settings
-  voices.value = profiles
+  voices.value = profiles.map(profile => {
+    profile.enabled ??= true
+    return profile
+  })
 })
 
-function addVoice() {
-  voices.value.push({ reference_id: '', name: '', bound_speaker: null, pool_order: voices.value.length, gender: '', traits: '' })
+function openAddVoice() {
+  newReferenceId.value = ''
+  addVoiceError.value = ''
+  showAddVoice.value = true
 }
 
 function removeVoice(index: number) { voices.value.splice(index, 1) }
+
+function hasCurrentSample(voice: VoiceProfile) {
+  return voice.sample_available && voice.sample_reference_id === voice.reference_id && Boolean(voice.sample_url)
+}
+
+async function validateVoice(voice: VoiceProfile) {
+  error.value = ''
+  voice.validating = true
+  try {
+    const result = await api.post<Partial<VoiceProfile>>('/api/v1/voices/validate', { reference_id: voice.reference_id })
+    voice.name ||= result.name || ''
+    voice.sample_available = true
+    voice.sample_reference_id = voice.reference_id
+    voice.sample_title = result.sample_title
+    voice.sample_text = result.sample_text
+    voice.sample_url = result.sample_url
+  } catch (reason) { error.value = (reason as Error).message }
+  finally { voice.validating = false }
+}
+
+async function addVoice() {
+  const referenceId = newReferenceId.value.trim()
+  addVoiceError.value = ''
+  if (!referenceId) { addVoiceError.value = '请输入 Fish Reference ID'; return }
+  if (voices.value.some(voice => voice.reference_id === referenceId)) { addVoiceError.value = '该音色已在音色池中'; return }
+  addingVoice.value = true
+  try {
+    const result = await api.post<Partial<VoiceProfile>>('/api/v1/voices/validate', { reference_id: referenceId })
+    voices.value.push({
+      reference_id: referenceId,
+      name: result.name || referenceId,
+      pool_order: voices.value.length,
+      gender: result.gender || '',
+      traits: result.traits || '',
+      enabled: true,
+      sample_available: true,
+      sample_reference_id: referenceId,
+      sample_title: result.sample_title,
+      sample_text: result.sample_text,
+      sample_url: result.sample_url,
+    })
+    showAddVoice.value = false
+  } catch (reason) { addVoiceError.value = (reason as Error).message }
+  finally { addingVoice.value = false }
+}
+
+function playSample(voice: VoiceProfile) {
+  if (!hasCurrentSample(voice) || !voice.sample_url) return
+  previewAudio?.pause()
+  previewAudio = new Audio(voice.sample_url)
+  void previewAudio.play()
+}
+
+onBeforeUnmount(() => previewAudio?.pause())
 
 async function save() {
   error.value = ''
@@ -134,23 +204,31 @@ async function save() {
           </div>
         </section>
         <section v-else class="panel voices-card">
-          <div class="panel-heading"><div><h2>Fish 音色池</h2><span class="muted">仅旁白固定绑定；角色音色在项目中选择</span></div><button class="button secondary" @click="addVoice"><Plus :size="15" />添加音色</button></div>
+          <div class="panel-heading"><div><h2>Fish 音色池</h2><span class="muted">管理全局可用音色；旁白与角色音色均在项目中选择</span></div><button class="button secondary" @click="openAddVoice"><Plus :size="15" />添加音色</button></div>
           <div class="voice-table">
-            <div class="voice-row voice-head"><span>显示名称</span><span>Fish Reference ID</span><span>性别</span><span>音色特征</span><span>旁白</span><span></span></div>
+            <div class="voice-row voice-head"><span>显示名称</span><span>Fish Reference ID</span><span>性别</span><span>备注</span><span>状态</span><span>操作</span></div>
             <div v-for="(voice, index) in voices" :key="voice.id || index" class="voice-row">
               <input v-model="voice.name" placeholder="音色名称" />
-              <input v-model="voice.reference_id" placeholder="reference id" />
+              <div class="voice-reference"><input v-model.trim="voice.reference_id" placeholder="reference id" /><button class="icon-button" :title="hasCurrentSample(voice) ? '重新检查并下载示例' : '检查并下载示例'" :disabled="!voice.reference_id || voice.validating" @click="validateVoice(voice)"><LoaderCircle v-if="voice.validating" class="spin" :size="15" /><CircleCheck v-else :size="15" /></button></div>
               <fieldset class="voice-gender" :aria-label="`${voice.name || `音色 ${index + 1}`}性别`">
                 <label v-for="option in [{ label: '未指定', value: '' }, { label: '男', value: '男' }, { label: '女', value: '女' }, { label: '中性', value: '中性' }]" :key="option.label"><input v-model="voice.gender" type="radio" :name="`voice-gender-${index}`" :value="option.value" />{{ option.label }}</label>
               </fieldset>
               <input v-model="voice.traits" placeholder="沉稳、清亮、低沉…" />
-              <label class="narrator-check" title="设为旁白"><input type="checkbox" :checked="voice.bound_speaker === 'NARRATOR'" @change="voices.forEach(item => item.bound_speaker = item === voice && ($event.target as HTMLInputElement).checked ? 'NARRATOR' : null)" /></label>
-              <button class="icon-button" title="移除音色" @click="removeVoice(index)"><Trash2 :size="15" /></button>
+              <label class="enabled-check"><input v-model="voice.enabled" type="checkbox" /><span>{{ voice.enabled ? '启用' : '禁用' }}<small>{{ hasCurrentSample(voice) ? '示例已缓存' : '待校验' }}</small></span></label>
+              <div class="voice-actions"><button class="icon-button" title="播放示例" :disabled="!hasCurrentSample(voice)" @click="playSample(voice)"><Play :size="15" /></button><button class="icon-button" title="移除音色" @click="removeVoice(index)"><Trash2 :size="15" /></button></div>
             </div>
             <p v-if="!voices.length" class="empty-voices">还没有配置音色，开始渲染前至少添加一个。</p>
           </div>
         </section>
       </div>
+    </div>
+    <div v-if="showAddVoice" class="modal-backdrop" @click.self="showAddVoice = false">
+      <form class="dialog voice-dialog" role="dialog" aria-modal="true" aria-labelledby="add-voice-title" @submit.prevent="addVoice">
+        <header><div><span class="eyebrow">Fish Audio</span><h2 id="add-voice-title">添加音色</h2></div><button class="icon-button" type="button" title="关闭" @click="showAddVoice = false"><X :size="19" /></button></header>
+        <label>Fish Reference ID<input v-model.trim="newReferenceId" autofocus placeholder="输入模型 ID" /></label>
+        <p v-if="addVoiceError" class="form-error">{{ addVoiceError }}</p>
+        <footer><button class="button secondary" type="button" @click="showAddVoice = false">取消</button><button class="button primary" type="submit" :disabled="addingVoice || !newReferenceId.trim()"><LoaderCircle v-if="addingVoice" class="spin" :size="16" />{{ addingVoice ? '正在校验...' : '校验并添加' }}</button></footer>
+      </form>
     </div>
   </section>
 </template>

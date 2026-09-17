@@ -16,6 +16,19 @@ if (-not (Test-Path -LiteralPath (Join-Path $frontendRoot "node_modules"))) {
     throw "Frontend dependencies not found. Run: npm --prefix frontend install"
 }
 
+$occupied = foreach ($port in 4200, 5173) {
+    $listener = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($null -ne $listener) {
+        $owner = Get-Process -Id $listener.OwningProcess -ErrorAction SilentlyContinue
+        $name = if ($null -ne $owner) { $owner.ProcessName } else { "unknown" }
+        "http://127.0.0.1:$port is already in use by PID $($listener.OwningProcess) ($name)"
+    }
+}
+if ($occupied) {
+    throw "Alexandria is already running or its ports are occupied:`n$($occupied -join "`n")`nStop the existing process before starting again."
+}
+
 $npm = (Get-Command npm.cmd -ErrorAction Stop).Source
 $backend = $null
 $frontend = $null

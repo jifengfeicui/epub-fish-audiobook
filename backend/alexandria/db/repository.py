@@ -24,6 +24,7 @@ from .models import (
     JobEvent,
     Project,
     ProjectSettings,
+    ProjectVoiceExclusion,
     ScriptEntry,
     ScriptRevision,
     SpeakerAssignment,
@@ -354,7 +355,7 @@ class Repository:
             return self._create_job(project_id, job_type)
 
     def _create_job(self, project_id: str, job_type: str) -> dict[str, Any]:
-        if job_type not in ("preprocess", "render"):
+        if job_type not in ("preprocess", "render", "merge"):
             raise ValueError("Invalid job type")
         with self.db.session() as session, session.begin():
             project = session.get(Project, project_id)
@@ -377,6 +378,22 @@ class Repository:
                     ready += int(revision is not None and revision.kind in ("reviewed", "manual"))
                 if not chapters or ready != len(chapters):
                     raise RuntimeError("render_not_ready")
+            elif job_type == "merge":
+                chapter_ids = set(session.scalars(
+                    select(Chapter.id).where(Chapter.project_id == project_id)
+                ).all())
+                artifacts = session.scalars(select(Artifact).where(
+                    Artifact.project_id == project_id,
+                    Artifact.kind == "chapter_mp3",
+                    Artifact.status == "active",
+                )).all()
+                valid_ids = {
+                    row.chapter_id
+                    for row in artifacts
+                    if (self.storage_root / row.path).is_file() and (self.storage_root / row.path).stat().st_size
+                }
+                if not chapter_ids or not chapter_ids.issubset(valid_ids):
+                    raise RuntimeError("merge_not_ready")
             job = Job(
                 id=str(uuid.uuid4()),
                 project_id=project_id,
@@ -588,14 +605,112 @@ class Repository:
         with self.db.session() as session:
             rows = session.scalars(select(VoiceProfile).order_by(VoiceProfile.pool_order, VoiceProfile.name)).all()
             return [
-                {"id": row.id, "reference_id": row.reference_id, "name": row.name, "bound_speaker": row.bound_speaker, "pool_order": row.pool_order, "gender": row.gender, "traits": row.traits}
+                self._voice_dict(row)
                 for row in rows
             ]
 
-    def replace_voices(self, voices: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        bindings = [voice.get("bound_speaker") for voice in voices if voice.get("bound_speaker")]
-        if any(binding != "NARRATOR" for binding in bindings) or len(bindings) > 1:
-            raise RuntimeError("Only one Fish voice may be bound to NARRATOR")
+    def _voice_dict(self, row: VoiceProfile) -> dict[str, Any]:
+        sample = bool(
+            row.sample_path
+            and row.sample_reference_id == row.reference_id
+            and (self.storage_root / row.sample_path).is_file()
+        )
+        return {
+            "id": row.id,
+            "reference_id": row.reference_id,
+            "name": row.name,
+            "pool_order": row.pool_order,
+            "gender": row.gender,
+            "traits": row.traits,
+            "enabled": row.enabled,
+            "sample_available": sample,
+            "sample_reference_id": row.sample_reference_id if sample else None,
+            "sample_title": row.sample_title if sample else None,
+            "sample_text": row.sample_text if sample else None,
+            "sample_url": f"/api/v1/voices/{row.id}/sample" if sample else None,
+        }
+
+    def _pending_sample_paths(self, reference_id: str) -> tuple[Path, Path]:
+        key = hashlib.sha256(reference_id.encode("utf-8")).hexdigest()
+        root = self.storage_root / "voices" / ".validated"
+        return root / f"{key}.wav", root / f"{key}.json"
+
+    def validate_voice(self, reference_id: str, base_url: str) -> dict[str, Any]:
+        import httpx
+
+        reference_id = reference_id.strip()
+        try:
+            response = httpx.get(f"{base_url.rstrip('/')}/model/{reference_id}", timeout=20, follow_redirects=True)
+            response.raise_for_status()
+            model = response.json()
+            samples = model.get("samples") or []
+            if model.get("state") != "trained" or model.get("dmca_taken_down") or not samples:
+                raise RuntimeError("voice_not_usable")
+            sample = samples[0]
+            audio_url = sample.get("audio")
+            if not audio_url:
+                raise RuntimeError("voice_sample_missing")
+            audio_response = httpx.get(audio_url, timeout=30, follow_redirects=True)
+            audio_response.raise_for_status()
+            audio = audio_response.content
+            if not audio:
+                raise RuntimeError("voice_sample_empty")
+        except RuntimeError:
+            raise
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            raise RuntimeError(f"voice_validation_failed: {exc}") from exc
+
+        audio_path, metadata_path = self._pending_sample_paths(reference_id)
+        audio_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_audio = audio_path.with_suffix(".wav.part")
+        temp_metadata = metadata_path.with_suffix(".json.part")
+        tags = [str(tag) for tag in model.get("tags") or []]
+        gender_tags = {"female": "女", "male": "男", "neutral": "中性"}
+        gender = next((gender_tags[tag.casefold()] for tag in tags if tag.casefold() in gender_tags), "")
+        category_tags = {
+            *gender_tags,
+            "zh", "en", "ja", "ko", "de", "fr", "es", "ru",
+            "chinese", "english", "japanese", "korean", "german", "french", "spanish", "russian",
+            "character-voice", "tts", "voice", "speech",
+        }
+        metadata = {
+            "reference_id": reference_id,
+            "name": str(model.get("title") or reference_id),
+            "gender": gender,
+            "traits": "、".join(tag for tag in tags if tag.casefold() not in category_tags),
+            "sample_title": str(sample.get("title") or ""),
+            "sample_text": str(sample.get("text") or ""),
+        }
+        temp_audio.write_bytes(audio)
+        temp_metadata.write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
+        temp_audio.replace(audio_path)
+        temp_metadata.replace(metadata_path)
+        return {
+            **metadata,
+            "status": "trained",
+            "sample_available": True,
+            "sample_url": f"/api/v1/voices/previews/{audio_path.stem}",
+        }
+
+    def get_voice_preview(self, token: str) -> Path:
+        if not re.fullmatch(r"[0-9a-f]{64}", token):
+            raise KeyError(token)
+        path = (self.storage_root / "voices" / ".validated" / f"{token}.wav").resolve()
+        if self.storage_root not in path.parents or not path.is_file():
+            raise KeyError(token)
+        return path
+
+    def get_voice_sample(self, voice_id: str) -> Path:
+        with self.db.session() as session:
+            row = session.get(VoiceProfile, voice_id)
+            if row is None or not row.sample_path or row.sample_reference_id != row.reference_id:
+                raise KeyError(voice_id)
+            path = (self.storage_root / row.sample_path).resolve()
+            if self.storage_root not in path.parents or not path.is_file():
+                raise KeyError(voice_id)
+            return path
+
+    def replace_voices(self, voices: list[dict[str, Any]], *, require_validation: bool = False) -> list[dict[str, Any]]:
         with self.db.session() as session, session.begin():
             active = session.scalar(select(Job.id).where(Job.status.in_(ACTIVE_JOB_STATES)).limit(1))
             if active:
@@ -613,32 +728,138 @@ class Repository:
                 session.execute(delete(VoiceProfile).where(VoiceProfile.id.in_(removed_ids)))
             for voice in voices:
                 row = existing.get(voice.get("id"))
+                is_new = row is None
+                changed_reference = bool(row and row.reference_id != voice["reference_id"])
+                pending_audio, pending_metadata = self._pending_sample_paths(voice["reference_id"])
+                if require_validation and (is_new or changed_reference) and not (pending_audio.is_file() and pending_metadata.is_file()):
+                    raise RuntimeError(f"voice_not_validated: {voice['name']}")
                 if row is None:
                     row = VoiceProfile(id=str(uuid.uuid4()))
                     session.add(row)
+                needs_sample = row.sample_reference_id != voice["reference_id"] or not row.sample_path or not (self.storage_root / row.sample_path).is_file()
+                disabling = row.enabled and not voice.get("enabled", True)
+                conflicts = self._voice_conflicts(session, row.id) if disabling and not is_new else []
+                if conflicts:
+                    raise RuntimeError(f"voice_in_use: {', '.join(conflicts)}")
+                if is_new or changed_reference or needs_sample:
+                    if pending_audio.is_file() and pending_metadata.is_file():
+                        metadata = json.loads(pending_metadata.read_text(encoding="utf-8"))
+                        sample_dir = self.storage_root / "voices" / row.id
+                        sample_dir.mkdir(parents=True, exist_ok=True)
+                        sample_path = sample_dir / "sample.wav"
+                        shutil.copyfile(pending_audio, sample_path)
+                        row.sample_path = sample_path.relative_to(self.storage_root).as_posix()
+                        row.sample_reference_id = voice["reference_id"]
+                        row.sample_title = metadata.get("sample_title") or None
+                        row.sample_text = metadata.get("sample_text") or None
+                    else:
+                        row.sample_path = None
+                        row.sample_reference_id = None
+                        row.sample_title = None
+                        row.sample_text = None
                 row.reference_id = voice["reference_id"]
                 row.name = voice["name"]
-                row.bound_speaker = voice.get("bound_speaker") or None
+                row.bound_speaker = None
                 row.pool_order = voice.get("pool_order", 0)
                 row.gender = voice.get("gender", "").strip()
                 row.traits = voice.get("traits", "").strip()
+                row.enabled = voice.get("enabled", True)
         return self.list_voices()
+
+    def _voice_conflicts(self, session, voice_id: str, *, project_id: str | None = None) -> list[str]:
+        rows = session.execute(
+            select(Project.title, SpeakerAssignment.speaker)
+            .join(SpeakerAssignment, SpeakerAssignment.project_id == Project.id)
+            .where(SpeakerAssignment.voice_profile_id == voice_id)
+            .where(SpeakerAssignment.project_id == project_id if project_id else True)
+        ).all()
+        return [f"{title} / {speaker}" for title, speaker in rows]
+
+    def get_project_voice_pool(self, project_id: str) -> dict[str, Any]:
+        with self.db.session() as session:
+            if session.get(Project, project_id) is None:
+                raise KeyError(project_id)
+            excluded = session.scalars(select(ProjectVoiceExclusion.voice_profile_id).where(ProjectVoiceExclusion.project_id == project_id)).all()
+            narrator = session.scalar(select(SpeakerAssignment.voice_profile_id).where(
+                SpeakerAssignment.project_id == project_id,
+                SpeakerAssignment.speaker == "NARRATOR",
+            ))
+            return {"excluded_voice_ids": list(excluded), "narrator_voice_profile_id": narrator}
+
+    def update_project_voice_pool(self, project_id: str, excluded_voice_ids: list[str], narrator_voice_profile_id: str | None) -> dict[str, Any]:
+        excluded = set(excluded_voice_ids)
+        with self.db.session() as session, session.begin():
+            if session.get(Project, project_id) is None:
+                raise KeyError(project_id)
+            active = session.scalar(select(Job.id).where(Job.project_id == project_id, Job.status.in_(ACTIVE_JOB_STATES)).limit(1))
+            if active:
+                raise RuntimeError("project_running")
+            requested = excluded | ({narrator_voice_profile_id} if narrator_voice_profile_id else set())
+            voices = {row.id: row for row in session.scalars(select(VoiceProfile).where(VoiceProfile.id.in_(requested))).all()} if requested else {}
+            if len(voices) != len(requested):
+                raise KeyError("voice")
+            if narrator_voice_profile_id and (not voices[narrator_voice_profile_id].enabled or narrator_voice_profile_id in excluded):
+                raise RuntimeError("narrator_voice_unavailable")
+            conflicts = []
+            for voice_id in excluded:
+                conflicts.extend(self._voice_conflicts(session, voice_id, project_id=project_id))
+            if narrator_voice_profile_id:
+                conflicts.extend(
+                    f"{title} / {speaker}" for title, speaker in session.execute(
+                        select(Project.title, SpeakerAssignment.speaker)
+                        .join(SpeakerAssignment, SpeakerAssignment.project_id == Project.id)
+                        .where(
+                            SpeakerAssignment.project_id == project_id,
+                            SpeakerAssignment.voice_profile_id == narrator_voice_profile_id,
+                            SpeakerAssignment.speaker != "NARRATOR",
+                        )
+                    ).all()
+                )
+            if conflicts:
+                raise RuntimeError(f"voice_in_use: {', '.join(conflicts)}")
+            old_excluded = set(session.scalars(select(ProjectVoiceExclusion.voice_profile_id).where(ProjectVoiceExclusion.project_id == project_id)).all())
+            narrator = session.scalar(select(SpeakerAssignment).where(
+                SpeakerAssignment.project_id == project_id,
+                SpeakerAssignment.speaker == "NARRATOR",
+            ))
+            old_narrator = narrator.voice_profile_id if narrator else None
+            session.execute(delete(ProjectVoiceExclusion).where(ProjectVoiceExclusion.project_id == project_id))
+            session.add_all(ProjectVoiceExclusion(project_id=project_id, voice_profile_id=voice_id) for voice_id in excluded)
+            if narrator_voice_profile_id:
+                if narrator is None:
+                    narrator = SpeakerAssignment(project_id=project_id, speaker="NARRATOR")
+                    session.add(narrator)
+                narrator.voice_profile_id = narrator_voice_profile_id
+                narrator.user_edited = True
+            elif narrator is not None:
+                session.delete(narrator)
+            if old_excluded != excluded or old_narrator != narrator_voice_profile_id:
+                session.execute(update(Artifact).where(Artifact.project_id == project_id, Artifact.status == "active").values(status="stale"))
+                session.execute(update(AudioSegment).where(AudioSegment.project_id == project_id).values(status="stale"))
+                project = session.get(Project, project_id)
+                project.status = "ready_for_tts"
+                project.updated_at = utcnow()
+        return self.get_project_voice_pool(project_id)
 
     def assign_voices(self, project_id: str, speakers: list[str]) -> dict[str, dict[str, str]]:
         """Resolve explicit choices and chapter-local random choices without persisting randomness."""
         with self.db.session() as session:
-            profiles = session.scalars(select(VoiceProfile).order_by(VoiceProfile.pool_order, VoiceProfile.name)).all()
+            excluded = select(ProjectVoiceExclusion.voice_profile_id).where(ProjectVoiceExclusion.project_id == project_id)
+            profiles = session.scalars(
+                select(VoiceProfile)
+                .where(VoiceProfile.enabled.is_(True), VoiceProfile.id.not_in(excluded))
+                .order_by(VoiceProfile.pool_order, VoiceProfile.name)
+            ).all()
             if not profiles:
                 raise RuntimeError("No Fish voices configured")
             existing_rows = session.scalars(select(SpeakerAssignment).where(SpeakerAssignment.project_id == project_id)).all()
             existing = {row.speaker: row.voice_profile_id for row in existing_rows}
             by_id = {row.id: row for row in profiles}
-            bound = {row.bound_speaker: row for row in profiles if row.bound_speaker}
-            reserved = {profile_id for profile_id in existing.values() if profile_id} | {row.id for row in bound.values()}
-            pool = [row for row in profiles if row.id not in reserved and not row.bound_speaker]
+            reserved = {profile_id for profile_id in existing.values() if profile_id}
+            pool = [row for row in profiles if row.id not in reserved]
             resolved: dict[str, VoiceProfile] = {}
             for speaker in speakers:
-                profile = resolved.get(speaker) or bound.get(speaker) or by_id.get(existing.get(speaker, ""))
+                profile = resolved.get(speaker) or by_id.get(existing.get(speaker, ""))
                 if profile is None and speaker != "NARRATOR":
                     character = next((row for row in existing_rows if row.speaker == speaker), None)
                     preferred = [row for row in pool if character and character.gender and row.gender == character.gender]
@@ -647,7 +868,7 @@ class Repository:
                         raise RuntimeError(f"No unbound Fish voice available for {speaker}")
                     profile = random.choice(choices)
                 if profile is None:
-                    raise RuntimeError("A Fish voice must be bound to NARRATOR")
+                    raise RuntimeError("narrator_voice_required")
                 resolved[speaker] = profile
             return {
                 speaker: {"reference_id": resolved[speaker].reference_id, "name": resolved[speaker].name}
@@ -699,7 +920,7 @@ class Repository:
                 row.line_count = values["line_count"]
                 row.importance = values["importance"]
                 row.first_seen = values["first_seen"]
-            stale = set(rows) - set(stats)
+            stale = set(rows) - set(stats) - {"NARRATOR"}
             if stale:
                 session.execute(delete(SpeakerAssignment).where(
                     SpeakerAssignment.project_id == project_id,
@@ -712,7 +933,7 @@ class Repository:
             rows = session.execute(
                 select(SpeakerAssignment, VoiceProfile)
                 .outerjoin(VoiceProfile, VoiceProfile.id == SpeakerAssignment.voice_profile_id)
-                .where(SpeakerAssignment.project_id == project_id)
+                .where(SpeakerAssignment.project_id == project_id, SpeakerAssignment.speaker != "NARRATOR")
                 .order_by(SpeakerAssignment.importance.desc(), SpeakerAssignment.first_seen)
             ).all()
             return [{
@@ -747,7 +968,14 @@ class Repository:
             active = session.scalar(select(Job.id).where(Job.project_id == project_id, Job.status.in_(ACTIVE_JOB_STATES)).limit(1))
             if active and not automated:
                 raise RuntimeError("project_running")
-            voices = {row.id: row for row in session.scalars(select(VoiceProfile)).all()}
+            excluded = select(ProjectVoiceExclusion.voice_profile_id).where(ProjectVoiceExclusion.project_id == project_id)
+            voices = {row.id: row for row in session.scalars(
+                select(VoiceProfile).where(VoiceProfile.enabled.is_(True), VoiceProfile.id.not_in(excluded))
+            ).all()}
+            narrator_voice_id = session.scalar(select(SpeakerAssignment.voice_profile_id).where(
+                SpeakerAssignment.project_id == project_id,
+                SpeakerAssignment.speaker == "NARRATOR",
+            ))
             for values in characters:
                 row = session.scalar(select(SpeakerAssignment).where(
                     SpeakerAssignment.project_id == project_id,
@@ -756,7 +984,7 @@ class Repository:
                 if row is None or (automated and row.user_edited):
                     continue
                 voice_id = values.get("voice_profile_id")
-                if voice_id and (voice_id not in voices or voices[voice_id].bound_speaker):
+                if voice_id and (voice_id not in voices or voice_id == narrator_voice_id):
                     raise RuntimeError("Character voices must come from the unbound Fish voice pool")
                 row.gender = values.get("gender", "").strip()
                 row.personality = values.get("personality", "").strip()
@@ -829,6 +1057,12 @@ class Repository:
         relative = absolute_path.resolve().relative_to(self.storage_root).as_posix()
         digest = hashlib.sha256(absolute_path.read_bytes()).hexdigest()
         with self.db.session() as session, session.begin():
+            if kind == "chapter_mp3":
+                session.execute(
+                    update(Artifact)
+                    .where(Artifact.project_id == project_id, Artifact.kind == "book_mp3", Artifact.status == "active")
+                    .values(status="stale")
+                )
             session.execute(
                 update(Artifact)
                 .where(Artifact.project_id == project_id, Artifact.chapter_id == chapter_id, Artifact.kind == kind, Artifact.status == "active")
