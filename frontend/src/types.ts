@@ -3,7 +3,8 @@ export type JobStatus = 'queued' | 'running' | 'pausing' | 'paused' | 'interrupt
 export interface Job {
   id: string
   project_id: string
-  type: 'preprocess' | 'render' | 'merge'
+  type: 'preprocess' | 'render' | 'merge' | 'bilibili' | 'character_analysis'
+  payload: Record<string, unknown>
   status: JobStatus
   render_start_mode: 'after_review_batch' | 'after_all_reviews'
   release_batch_size: number
@@ -30,6 +31,7 @@ export interface Project {
   source_filename: string
   status: string
   chapter_count: number
+  included_chapter_count: number
   chapter_status_counts: Record<string, number>
   created_at: string
   updated_at: string
@@ -53,7 +55,9 @@ export interface Chapter {
   id: number
   project_id: string
   position: number
+  included_position: number | null
   title: string
+  included: boolean
   status: string
   active_revision_id: string | null
 }
@@ -87,4 +91,43 @@ export interface Artifact {
   kind: 'chapter_mp3' | 'book_mp3'
   path: string
   size: number
+}
+
+export type BilibiliChapterState = 'missing' | 'ready' | 'published' | 'outdated' | 'remote_mismatch'
+
+export interface BilibiliChapter {
+  id: number
+  position: number
+  title: string
+  bilibili_state: BilibiliChapterState
+  image_url: string | null
+  video_url: string | null
+}
+
+export interface BilibiliForm {
+  author: string
+  publisher: string
+  source: string
+  title: string
+  tid: number
+  tags: string
+  desc: string
+  visibility: 'only_self' | 'public'
+  line: string
+}
+
+export interface BilibiliStatus {
+  continuous_audio_count: number
+  prepared_count: number
+  published_count: number
+  appendable_count: number
+  form: BilibiliForm
+  publication: null | {
+    bvid: string
+    aid?: string | null
+    last_sync_at?: string
+    sync_error?: string
+    remote_mismatch?: boolean
+  }
+  chapters: BilibiliChapter[]
 }

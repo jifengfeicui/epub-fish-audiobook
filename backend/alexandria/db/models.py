@@ -61,6 +61,7 @@ class Chapter(Base):
     href: Mapped[str] = mapped_column(String(1000))
     source_text: Mapped[str] = mapped_column(Text)
     source_hash: Mapped[str] = mapped_column(String(64))
+    included: Mapped[bool] = mapped_column(Boolean, default=True)
     status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
     active_revision_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
 
@@ -147,6 +148,7 @@ class Job(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
     job_type: Mapped[str] = mapped_column(String(30), default="pipeline")
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
     status: Mapped[str] = mapped_column(String(30), default="queued", index=True)
     render_start_mode: Mapped[str] = mapped_column(String(32))
     release_batch_size: Mapped[int] = mapped_column(Integer)

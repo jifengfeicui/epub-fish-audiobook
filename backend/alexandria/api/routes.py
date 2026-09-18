@@ -8,7 +8,7 @@ import aiofiles
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 
-from backend.alexandria.api.schemas import CharacterListUpdate, JobCreate, ProjectUpdate, ProjectVoicePoolUpdate, ScriptUpdate, SettingsUpdate, VoiceListUpdate, VoiceValidationInput
+from backend.alexandria.api.schemas import BilibiliJobCreate, ChapterListUpdate, CharacterListUpdate, JobCreate, ProjectUpdate, ProjectVoicePoolUpdate, ScriptUpdate, SettingsUpdate, VoiceListUpdate, VoiceValidationInput
 from backend.alexandria.db.repository import Repository
 from backend.alexandria.domain.pipeline import RENDER_START_MODES
 
@@ -32,6 +32,8 @@ def _http_error(exc: Exception) -> HTTPException:
         "not_running": (409, "The job is not running"),
         "not_resumable": (409, "The job cannot be resumed"),
         "invalid_chapter_range": (422, "The selected chapter range is invalid"),
+        "no_included_chapters": (422, "At least one chapter must remain included"),
+        "invalid_chapter_ids": (422, "Included chapters must belong to this project"),
         "voice_in_use": (409, "This voice is assigned to a project and cannot be removed"),
         "render_not_ready": (409, "All selected chapters must finish preprocessing before TTS can start"),
         "merge_not_ready": (409, "Every chapter must have valid audio before the book can be merged"),
@@ -40,6 +42,16 @@ def _http_error(exc: Exception) -> HTTPException:
         "voice_sample_empty": (422, "Fish returned an empty voice sample"),
         "narrator_voice_required": (409, "Select a narrator voice in project settings before starting TTS"),
         "narrator_voice_unavailable": (409, "The project narrator must be an enabled voice in the project pool"),
+        "bilibili_publication_exists": (409, "已投稿的项目不能重新识别章节"),
+        "bilibili_not_logged_in": (409, "请先在设置中登录B站账号"),
+        "bilibili_no_continuous_audio": (409, "还没有从首章开始连续生成的章节音频"),
+        "bilibili_not_prepared": (409, "请先准备章节视频"),
+        "bilibili_already_published": (409, "该项目已经首发，请使用追加"),
+        "bilibili_not_published": (409, "该项目尚未首发"),
+        "bilibili_replace_outdated_first": (409, "已发布章节音频有变化，请先替换再追加"),
+        "bilibili_public_confirmation_required": (422, "公开投稿需要二次确认"),
+        "bilibili_source_required": (422, "转载来源不能为空"),
+        "bilibili_invalid_parts": (422, "分P数量超出当前可用范围"),
     }
     message = str(exc)
     key = next((item for item in mapping if message == item or message.startswith(f"{item}:")), None)
@@ -164,6 +176,14 @@ def list_chapters(project_id: str, request: Request):
         raise _http_error(exc) from exc
 
 
+@router.put("/projects/{project_id}/chapters")
+def update_chapters(project_id: str, payload: ChapterListUpdate, request: Request):
+    try:
+        return _repo(request).set_chapter_inclusion(project_id, payload.included_chapter_ids)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
 @router.get("/chapters/{chapter_id}/script")
 def get_script(chapter_id: int, request: Request):
     try:
@@ -187,7 +207,7 @@ def update_script(chapter_id: int, payload: ScriptUpdate, request: Request):
 @router.post("/projects/{project_id}/jobs", status_code=201)
 def create_job(project_id: str, payload: JobCreate, request: Request):
     try:
-        return _repo(request).create_job(project_id, payload.type)
+        return _repo(request).create_job(project_id, payload.type, payload.payload)
     except Exception as exc:
         raise _http_error(exc) from exc
 
@@ -247,6 +267,52 @@ def play_artifact(artifact_id: str, request: Request):
     return FileResponse(path, media_type="audio/mpeg", content_disposition_type="inline")
 
 
+@router.get("/bilibili/account")
+def bilibili_account(request: Request):
+    return request.app.state.bilibili.account_status()
+
+
+@router.post("/bilibili/login")
+def bilibili_login(request: Request):
+    try:
+        return request.app.state.bilibili.start_login()
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/bilibili/login/{session_id}")
+def bilibili_login_poll(session_id: str, request: Request):
+    try:
+        return request.app.state.bilibili.poll_login(session_id)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/projects/{project_id}/bilibili")
+def bilibili_status(project_id: str, request: Request):
+    try:
+        return request.app.state.bilibili.status(project_id)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/projects/{project_id}/bilibili/jobs", status_code=201)
+def create_bilibili_job(project_id: str, payload: BilibiliJobCreate, request: Request):
+    try:
+        return _repo(request).create_job(project_id, "bilibili", payload.model_dump())
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/projects/{project_id}/bilibili/media/{chapter_id}/{kind}")
+def bilibili_media(project_id: str, chapter_id: int, kind: str, request: Request):
+    try:
+        path = request.app.state.bilibili.media_path(project_id, chapter_id, kind)
+        return FileResponse(path, media_type="video/mp4" if kind == "video" else "image/jpeg")
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
 @router.get("/projects/{project_id}/speaker-assignments")
 def list_speaker_assignments(project_id: str, request: Request):
     try:
@@ -285,7 +351,12 @@ def download_artifact(artifact_id: str, request: Request):
         raise _http_error(exc) from exc
     if repository.storage_root not in path.parents or not path.is_file():
         raise HTTPException(status_code=404, detail="Artifact file not found")
-    return FileResponse(path, filename=path.name, media_type="audio/mpeg")
+    filename = path.name
+    if artifact["kind"] == "chapter_mp3" and artifact["chapter_id"] is not None:
+        chapter = next(row for row in repository.list_chapters(artifact["project_id"]) if row["id"] == artifact["chapter_id"])
+        if chapter["included_position"] is not None:
+            filename = f"{chapter['included_position']:04d}-{Path(filename).name.split('-', 1)[-1]}"
+    return FileResponse(path, filename=filename, media_type="audio/mpeg")
 
 
 @router.get("/settings")

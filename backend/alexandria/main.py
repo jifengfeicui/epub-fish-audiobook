@@ -20,6 +20,7 @@ from backend.alexandria.scheduler.broker import EventBroker
 from backend.alexandria.scheduler.manager import Scheduler
 from backend.alexandria.scheduler.runner import PipelineRunner
 from backend.alexandria.services.stages import StageExecutor
+from backend.alexandria.services.bilibili import BilibiliService
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -97,7 +98,8 @@ def create_app(data_dir: Path | None = None, *, start_scheduler: bool = True) ->
                 "error": "Service restarted while the job was running",
             })
         executor = StageExecutor(repository, ROOT)
-        runner = PipelineRunner(repository, executor, broker)
+        bilibili = BilibiliService(repository)
+        runner = PipelineRunner(repository, executor, broker, bilibili)
         scheduler = Scheduler(repository, runner)
     except Exception:
         database.close()
@@ -119,6 +121,7 @@ def create_app(data_dir: Path | None = None, *, start_scheduler: bool = True) ->
     application.state.repository = repository
     application.state.broker = broker
     application.state.scheduler = scheduler
+    application.state.bilibili = bilibili
     application.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],

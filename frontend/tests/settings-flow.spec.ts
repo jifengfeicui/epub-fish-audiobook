@@ -81,3 +81,18 @@ test('adds a voice from only its Fish id without rendering sample text', async (
   await expect(page.getByText('不应显示的示例文字')).toHaveCount(0)
   await expect(page.locator('button[title="播放示例"]:not([disabled])')).toHaveCount(1)
 })
+
+test('shows Bilibili account state and completes QR login polling', async ({ page }) => {
+  await page.route('**/api/v1/settings', route => route.fulfill({ json: settings }))
+  await page.route('**/api/v1/voices', route => route.fulfill({ json: [] }))
+  await page.route('**/api/v1/bilibili/account', route => route.fulfill({ json: { logged_in: false, name: null } }))
+  await page.route('**/api/v1/bilibili/login', route => route.fulfill({ json: { session_id: 'qr-1', url: 'https://example.test/qr', expires_at: '2099-01-01T00:00:00Z' } }))
+  await page.route('**/api/v1/bilibili/login/qr-1', route => route.fulfill({ json: { status: 'success', name: '测试账号' } }))
+
+  await page.goto('/settings')
+  await page.getByRole('navigation', { name: '配置分类' }).getByRole('button', { name: 'B站账号' }).click()
+  await expect(page.getByText('未登录', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: '扫码登录' }).click()
+  await expect(page.locator('canvas')).toBeVisible()
+  await expect(page.getByText('测试账号')).toBeVisible({ timeout: 4000 })
+})

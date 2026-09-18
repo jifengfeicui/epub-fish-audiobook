@@ -47,7 +47,7 @@ function created(project: Project) {
       <article v-for="project in filtered" :key="project.id" class="project-card" @click="router.push(`/projects/${project.id}`)">
         <div class="project-card-top"><span class="book-spine">{{ project.title.slice(0, 1) }}</span><StatusBadge :status="project.latest_job?.status || project.status" /></div>
         <h2>{{ project.title }}</h2><span class="muted">{{ project.source_filename }}</span>
-        <div class="card-meta"><span>{{ project.chapter_count }} 章</span><span>{{ project.chapter_status_counts.done || 0 }} 已完成</span><span class="card-actions"><button class="icon-button" :title="archived ? '恢复项目' : '归档项目'" @click.stop="toggleArchive(project)"><component :is="archived ? ArchiveRestore : Archive" :size="15" /></button><button class="icon-button danger-icon" title="永久删除" @click.stop="removeProject(project)"><Trash2 :size="15" /></button></span><ArrowRight :size="17" /></div>
+        <div class="card-meta"><span>{{ project.included_chapter_count ?? project.chapter_count }}/{{ project.chapter_count }} 章</span><span>{{ project.chapter_status_counts.done || 0 }} 已完成</span><span class="card-actions"><button class="icon-button" :title="archived ? '恢复项目' : '归档项目'" @click.stop="toggleArchive(project)"><component :is="archived ? ArchiveRestore : Archive" :size="15" /></button><button class="icon-button danger-icon" title="永久删除" @click.stop="removeProject(project)"><Trash2 :size="15" /></button></span><ArrowRight :size="17" /></div>
       </article>
     </div>
     <EmptyState v-else :title="archived ? '没有已归档项目' : '还没有项目'" :detail="archived ? '归档后的项目会显示在这里。' : '导入 EPUB 或 TXT，开始建立有声书。'"><button v-if="!archived" class="button secondary" @click="showDialog = true"><Plus :size="17" />导入书籍</button></EmptyState>

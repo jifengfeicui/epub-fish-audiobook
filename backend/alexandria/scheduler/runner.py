@@ -5,13 +5,15 @@ from typing import Any
 from backend.alexandria.db.repository import Repository
 from backend.alexandria.scheduler.broker import EventBroker
 from backend.alexandria.services.stages import StageCancelled, StageExecutor
+from backend.alexandria.services.bilibili import BilibiliService
 
 
 class PipelineRunner:
-    def __init__(self, repository: Repository, executor: StageExecutor, broker: EventBroker):
+    def __init__(self, repository: Repository, executor: StageExecutor, broker: EventBroker, bilibili: BilibiliService | None = None):
         self.repo = repository
         self.executor = executor
         self.broker = broker
+        self.bilibili = bilibili or BilibiliService(repository)
 
     def _event(self, job: dict[str, Any], event_type: str, payload: dict[str, Any]) -> None:
         self.repo.add_event(job["id"], job["project_id"], event_type, payload)
@@ -25,21 +27,26 @@ class PipelineRunner:
             return
         project = self.repo.get_project(job["project_id"])
         try:
-            if job["type"] == "merge":
+            if job["type"] == "bilibili":
+                self.bilibili.run(job, lambda message: self._log(job, "bilibili", message), lambda: self.repo.is_stop_requested(job_id))
+            elif job["type"] == "merge":
                 self._merge(job, project)
             elif job["type"] == "render":
                 self._render(job, project)
+            elif job["type"] == "character_analysis":
+                self._analyze_characters(job, project)
             else:
                 self._preprocess(job, project)
         except Exception as exc:
+            error = self.bilibili._redact(str(exc)) if job["type"] == "bilibili" else str(exc)
             if not isinstance(exc, StageCancelled):
-                self._log(job, job["type"], str(exc))
+                self._log(job, job["type"], error)
             if self.repo.is_stop_requested(job_id):
                 current = self.repo.get_job(job_id)
                 if current["status"] != "cancelled":
                     self.repo.set_job_status(job_id, "paused")
             else:
-                self.repo.set_job_status(job_id, "paused", str(exc))
+                self.repo.set_job_status(job_id, "paused", error)
             return
         if self.repo.is_stop_requested(job_id):
             current = self.repo.get_job(job_id)
@@ -51,7 +58,7 @@ class PipelineRunner:
             self.repo.set_project_status(project["id"], "ready_for_tts")
 
     def _preprocess(self, job: dict[str, Any], project: dict[str, Any]) -> None:
-        for chapter_data in self.repo.list_selected_chapters(project["id"]):
+        for chapter_data in self.repo.list_included_chapters(project["id"]):
             if self.repo.is_stop_requested(job["id"]):
                 raise StageCancelled("Stage cancelled")
             chapter_id = chapter_data["id"]
@@ -106,12 +113,19 @@ class PipelineRunner:
             self.repo.update_chapter_status(chapter_id, "reviewed")
             self._event(job, "chapter.reviewed", {"chapter_id": chapter_id, "position": chapter.position})
 
+        try:
+            self._analyze_characters(job, project)
+        except Exception as exc:
+            self._log(job, "character_analysis", str(exc))
+            self._event(job, "characters.failed", {"error": str(exc)})
+
+    def _analyze_characters(self, job: dict[str, Any], project: dict[str, Any]) -> None:
         self.repo.refresh_characters(project["id"])
-        self.executor.analyze_characters(project)
-        self._event(job, "characters.completed", {"count": len(self.repo.list_characters(project["id"]))})
+        characters = self.executor.analyze_characters(project)
+        self._event(job, "characters.completed", {"count": len(characters)})
 
     def _render(self, job: dict[str, Any], project: dict[str, Any]) -> None:
-        chapters = self.repo.list_selected_chapters(project["id"])
+        chapters = self.repo.list_selected_chapters(project["id"], job["payload"])
         for chapter_data in chapters:
             if self.repo.is_stop_requested(job["id"]):
                 raise StageCancelled("Stage cancelled")
@@ -139,7 +153,7 @@ class PipelineRunner:
             self.repo.update_stage(job["id"], chapter_id, "render", "completed")
             self.repo.update_chapter_status(chapter_id, "done")
             self._event(job, "chapter.rendered", {"chapter_id": chapter_id, "position": chapter.position, "output": str(output)})
-        if len(chapters) == project["chapter_count"]:
+        if len(chapters) == project["included_chapter_count"]:
             self._merge(job, project)
 
     def _merge(self, job: dict[str, Any], project: dict[str, Any]) -> None:

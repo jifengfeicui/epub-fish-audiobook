@@ -259,6 +259,11 @@ class RepositoryTests(RepositoryTestCase):
         large = self.repo.list_characters(project["id"])[0]
         self.assertEqual((large["gender"], large["personality"], large["user_edited"]), ("女", "人工资料", True))
 
+        self.repo.update_characters(project["id"], [{"speaker": "Small", "gender": "", "personality": "", "voice_profile_id": None}])
+        self.repo.update_characters(project["id"], [{"speaker": "Small", "gender": "男", "personality": "自动资料"}], automated=True)
+        small = next(row for row in self.repo.list_characters(project["id"]) if row["speaker"] == "Small")
+        self.assertEqual((small["gender"], small["personality"], small["user_edited"]), ("男", "自动资料", True))
+
     def test_script_edit_preserves_text_and_invalidates_only_its_audio(self):
         project = self.project()
         chapters = self.repo.list_chapters(project["id"])
@@ -409,16 +414,77 @@ class PipelineTests(RepositoryTestCase):
 
     def test_partial_render_does_not_merge_book(self):
         project = self.project(2)
-        self.repo.update_project(project["id"], {"from_chapter": 1, "to_chapter": 1})
         for chapter in self.repo.list_chapters(project["id"]):
             self.repo.save_revision(chapter["id"], "reviewed", [{"speaker": "NARRATOR", "text": "text", "instruct": ""}])
-        job = self.repo.create_job(project["id"], "render")
+        job = self.repo.create_job(project["id"], "render", {"from_included_position": 1, "to_included_position": 1})
         executor = FakeExecutor(self.repo)
 
         PipelineRunner(self.repo, executor, EventBroker()).run(job["id"])
 
         self.assertEqual(executor.rendered, [self.repo.list_chapters(project["id"])[0]["id"]])
         self.assertEqual(executor.merged, 0)
+
+    def test_included_positions_are_continuous_without_changing_original_positions(self):
+        project = self.project(3)
+        chapters = self.repo.list_chapters(project["id"])
+
+        rows = self.repo.set_chapter_inclusion(project["id"], [chapters[1]["id"], chapters[2]["id"]])
+
+        self.assertEqual([(row["position"], row["included_position"]) for row in rows], [(1, None), (2, 1), (3, 2)])
+
+    def test_character_analysis_job_does_not_preprocess_chapters(self):
+        project = self.project(1)
+        executor = FakeExecutor(self.repo)
+        job = self.repo.create_job(project["id"], "character_analysis")
+
+        PipelineRunner(self.repo, executor, EventBroker()).run(job["id"])
+
+        self.assertEqual(executor.analyzed, 1)
+        self.assertEqual(executor.generated, [])
+        self.assertEqual(executor.reviewed, [])
+        self.assertEqual(self.repo.get_job(job["id"])["status"], "completed")
+
+    def test_automatic_character_analysis_failure_does_not_fail_preprocess(self):
+        project = self.project(1)
+        executor = FakeExecutor(self.repo)
+        job = self.repo.create_job(project["id"], "preprocess")
+
+        with patch.object(executor, "analyze_characters", side_effect=RuntimeError("analysis failed")):
+            PipelineRunner(self.repo, executor, EventBroker()).run(job["id"])
+
+        self.assertEqual(self.repo.get_job(job["id"])["status"], "completed")
+        self.assertEqual(self.repo.get_project(project["id"])["status"], "ready_for_tts")
+        events = self.repo.list_events(project["id"])
+        self.assertTrue(any(event["type"] == "characters.failed" and event["payload"]["error"] == "analysis failed" for event in events))
+        self.assertTrue(any(event["type"] == "log" and event["payload"]["channel"] == "character_analysis" for event in events))
+        self.assertEqual(self.repo.create_job(project["id"], "character_analysis")["type"], "character_analysis")
+
+    def test_render_range_rejects_zero_out_of_bounds_and_non_numeric_values(self):
+        project = self.project(2)
+
+        for payload in (
+            {"from_included_position": 0, "to_included_position": 1},
+            {"from_included_position": 1, "to_included_position": 3},
+            {"from_included_position": "bad", "to_included_position": 1},
+        ):
+            with self.subTest(payload=payload), self.assertRaisesRegex(RuntimeError, "invalid_chapter_range"):
+                self.repo.create_job(project["id"], "render", payload)
+
+    def test_resumed_render_skips_chapters_excluded_while_paused(self):
+        project = self.project(2)
+        chapters = self.repo.list_chapters(project["id"])
+        for chapter in chapters:
+            self.repo.save_revision(chapter["id"], "reviewed", [{"speaker": "NARRATOR", "text": "text", "instruct": ""}])
+        job = self.repo.create_job(project["id"], "render")
+        self.repo.set_job_status(job["id"], "paused")
+        self.repo.set_chapter_inclusion(project["id"], [chapters[1]["id"]])
+        self.repo.resume_job(job["id"])
+        executor = FakeExecutor(self.repo)
+
+        PipelineRunner(self.repo, executor, EventBroker()).run(job["id"])
+
+        self.assertEqual(executor.rendered, [chapters[1]["id"]])
+        self.assertEqual(self.repo.get_job(job["id"])["status"], "completed")
 
     def test_merge_job_requires_all_chapter_audio_and_merges_all_chapters(self):
         project = self.project(2)
@@ -459,6 +525,56 @@ class PipelineTests(RepositoryTestCase):
             StageExecutor(self.repo, Path(__file__).parents[1]).merge_book(project, lambda _message: None)
 
         self.assertEqual(merged_files, expected)
+
+    def test_chapter_exclusion_filters_pipeline_characters_and_merge(self):
+        project = self.project(3)
+        chapters = self.repo.list_chapters(project["id"])
+        revisions = [
+            self.repo.save_revision(chapter["id"], "reviewed", [{"speaker": speaker, "text": "text", "instruct": ""}])
+            for chapter, speaker in zip(chapters, ("Intro", "Main", "Second"))
+        ]
+        self.repo.refresh_characters(project["id"])
+        segment_path = f"projects/{project['id']}/audio/0001/000001.mp3"
+        (self.repo.storage_root / segment_path).parent.mkdir(parents=True, exist_ok=True)
+        (self.repo.storage_root / segment_path).write_bytes(b"segment")
+        self.repo.save_audio_segment(
+            project_id=project["id"], chapter_id=chapters[0]["id"], revision_id=revisions[0]["revision_id"],
+            position=1, fingerprint="cached", path=segment_path, status="done", attempts=1,
+        )
+        for chapter in chapters[1:]:
+            path = self.repo.storage_root / "projects" / project["id"] / "output" / f"{chapter['position']}.mp3"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"mp3")
+            self.repo.save_artifact(project["id"], chapter["id"], "chapter_mp3", path)
+        book = self.repo.storage_root / "projects" / project["id"] / "output" / "book.mp3"
+        book.write_bytes(b"book")
+        self.repo.save_artifact(project["id"], None, "book_mp3", book)
+
+        rows = self.repo.set_chapter_inclusion(project["id"], [chapters[1]["id"], chapters[2]["id"]])
+
+        self.assertEqual([row["position"] for row in rows if row["included"]], [2, 3])
+        self.assertEqual(self.repo.get_project(project["id"])["included_chapter_count"], 2)
+        self.assertEqual([row["position"] for row in self.repo.list_selected_chapters(project["id"])], [2, 3])
+        self.assertEqual([row["speaker"] for row in self.repo.list_characters(project["id"])], ["Main", "Second"])
+        self.assertEqual(self.repo.reusable_audio_segment(chapters[0]["id"], 1, "cached"), segment_path)
+        self.assertNotIn("book_mp3", [row["kind"] for row in self.repo.list_artifacts(project["id"])])
+        self.assertEqual(self.repo.create_job(project["id"], "merge")["type"], "merge")
+
+    def test_chapter_exclusion_validation_and_paused_job(self):
+        project = self.project(2)
+        chapters = self.repo.list_chapters(project["id"])
+        with self.assertRaisesRegex(RuntimeError, "no_included_chapters"):
+            self.repo.set_chapter_inclusion(project["id"], [])
+        with self.assertRaisesRegex(RuntimeError, "invalid_chapter_ids"):
+            self.repo.set_chapter_inclusion(project["id"], [chapters[0]["id"], 999999])
+        job = self.repo.create_job(project["id"])
+        with self.assertRaisesRegex(RuntimeError, "project_running"):
+            self.repo.set_chapter_inclusion(project["id"], [chapters[1]["id"]])
+        self.repo.set_job_status(job["id"], "paused")
+        self.assertEqual(
+            [row["position"] for row in self.repo.set_chapter_inclusion(project["id"], [chapters[1]["id"]]) if row["included"]],
+            [2],
+        )
 
     def test_render_requires_every_selected_chapter_to_be_preprocessed(self):
         project = self.project(2)

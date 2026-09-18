@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from typing import Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator
 
 
 RenderStartMode = Literal["after_review_batch", "after_all_reviews"]
-JobType = Literal["preprocess", "render", "merge"]
+JobType = Literal["preprocess", "render", "merge", "character_analysis"]
+UploadLine = Literal["cnbldsa", "bda2", "txa", "alia"]
 
 
 class ProjectUpdate(BaseModel):
@@ -21,6 +22,10 @@ class ProjectUpdate(BaseModel):
     speaker_name: Optional[str] = Field(default=None, min_length=1, max_length=200)
     instruct: Optional[str] = Field(default=None, max_length=1000)
     archived: Optional[bool] = None
+
+
+class ChapterListUpdate(BaseModel):
+    included_chapter_ids: list[int]
 
 
 class ScriptEntryInput(BaseModel):
@@ -51,6 +56,44 @@ class ScriptUpdate(BaseModel):
 
 class JobCreate(BaseModel):
     type: JobType
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class BilibiliPrepareJob(BaseModel):
+    action: Literal["prepare"]
+
+
+class BilibiliPublishJob(BaseModel):
+    action: Literal["publish"]
+    parts: int = Field(ge=1)
+    source: str = Field(min_length=1, max_length=500)
+    title: str = Field(min_length=1, max_length=80)
+    author: str = Field(default="", max_length=200)
+    publisher: str = Field(default="", max_length=200)
+    tid: int = Field(default=201, ge=1)
+    tags: str = Field(default="有声书,读书,知识分享,AI配音", min_length=1, max_length=200)
+    desc: str = Field(default="", max_length=2000)
+    visibility: Literal["only_self", "public"] = "only_self"
+    confirm_public: bool = False
+    line: UploadLine = "cnbldsa"
+
+
+class BilibiliAppendJob(BaseModel):
+    action: Literal["append"]
+    parts: int = Field(ge=1)
+    line: UploadLine = "cnbldsa"
+
+
+class BilibiliReplaceJob(BaseModel):
+    action: Literal["replace"]
+    chapter_id: int = Field(ge=1)
+    line: UploadLine = "cnbldsa"
+
+
+BilibiliJobCreate = Annotated[
+    Union[BilibiliPrepareJob, BilibiliPublishJob, BilibiliAppendJob, BilibiliReplaceJob],
+    Field(discriminator="action"),
+]
 
 
 class SettingsUpdate(BaseModel):

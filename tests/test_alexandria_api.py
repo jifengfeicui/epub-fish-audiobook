@@ -73,6 +73,12 @@ class ApiTests(unittest.TestCase):
             self.client.post(f"/api/v1/projects/{project_id}/jobs", json={"type": "merge"}).status_code,
             409,
         )
+        invalid_range = self.client.post(
+            f"/api/v1/projects/{project_id}/jobs",
+            json={"type": "render", "payload": {"from_included_position": 0, "to_included_position": 1}},
+        )
+        self.assertEqual(invalid_range.status_code, 422)
+        self.assertEqual(invalid_range.json()["detail"], "The selected chapter range is invalid")
         job = self.client.post(f"/api/v1/projects/{project_id}/jobs", json={"type": "preprocess"})
         self.assertEqual(job.status_code, 201)
         self.assertEqual(job.json()["type"], "preprocess")
@@ -81,6 +87,59 @@ class ApiTests(unittest.TestCase):
         reparsed = self.client.post(f"/api/v1/projects/{project_id}/reparse")
         self.assertEqual(reparsed.status_code, 200)
         self.assertIsNone(reparsed.json()["latest_job"])
+
+    def test_chapter_inclusion_endpoint(self):
+        created = self.client.post(
+            "/api/v1/projects",
+            files={"file": ("book.txt", BytesIO("第1章\n正文\n第2章\n正文".encode("utf-8")), "text/plain")},
+        )
+        project_id = created.json()["id"]
+        chapters = self.client.get(f"/api/v1/projects/{project_id}/chapters").json()
+        self.assertTrue(all(chapter["included"] for chapter in chapters))
+        updated = self.client.put(
+            f"/api/v1/projects/{project_id}/chapters",
+            json={"included_chapter_ids": [chapters[1]["id"]]},
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual([row["position"] for row in updated.json() if row["included"]], [2])
+        self.assertEqual([row["included_position"] for row in updated.json()], [None, 1])
+        self.assertEqual(self.client.get(f"/api/v1/projects/{project_id}").json()["included_chapter_count"], 1)
+        self.assertEqual(
+            self.client.put(f"/api/v1/projects/{project_id}/chapters", json={"included_chapter_ids": []}).status_code,
+            422,
+        )
+
+    def test_bilibili_account_and_job_payload(self):
+        created = self.client.post(
+            "/api/v1/projects",
+            files={"file": ("book.txt", BytesIO("第1章\n正文".encode("utf-8")), "text/plain")},
+        )
+        project_id = created.json()["id"]
+        self.assertEqual(self.client.get("/api/v1/bilibili/account").json(), {"logged_in": False, "name": None})
+        job = self.client.post(f"/api/v1/projects/{project_id}/bilibili/jobs", json={"action": "prepare"})
+        self.assertEqual(job.status_code, 201)
+        self.assertEqual(job.json()["type"], "bilibili")
+        self.assertEqual(job.json()["payload"], {"action": "prepare"})
+        invalid = self.client.post(f"/api/v1/projects/{project_id}/bilibili/jobs", json={"action": "append", "parts": 0})
+        self.assertEqual(invalid.status_code, 422)
+        invalid_line = self.client.post(f"/api/v1/projects/{project_id}/bilibili/jobs", json={"action": "append", "parts": 1, "line": "unknown"})
+        self.assertEqual(invalid_line.status_code, 422)
+
+    def test_artifact_play_still_returns_audio(self):
+        created = self.client.post(
+            "/api/v1/projects",
+            files={"file": ("book.txt", BytesIO("第1章\n正文".encode("utf-8")), "text/plain")},
+        )
+        project_id = created.json()["id"]
+        chapter_id = self.client.get(f"/api/v1/projects/{project_id}/chapters").json()[0]["id"]
+        output = Path(self.temp.name) / "projects" / project_id / "output" / "1.mp3"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"audio")
+        artifact = self.client.app.state.repository.save_artifact(project_id, chapter_id, "chapter_mp3", output)
+        response = self.client.get(f"/api/v1/artifacts/{artifact['id']}/play")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "audio/mpeg")
+        self.assertEqual(response.content, b"audio")
 
 
 if __name__ == "__main__":

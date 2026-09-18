@@ -232,7 +232,7 @@ class StageExecutor:
         from openai import OpenAI
 
         characters = self.repo.refresh_characters(project["id"])
-        pending = [row for row in characters if not row["user_edited"] and (not row["gender"] or not row["personality"])]
+        pending = [row for row in characters if not row["gender"] or not row["personality"]]
         if not pending:
             return characters
         samples = self.repo.character_samples(project["id"], [row["speaker"] for row in pending])
@@ -242,7 +242,6 @@ class StageExecutor:
             api_key=settings.get("llm_api_key", "local"),
             timeout=60,
         )
-        payload = [{"speaker": row["speaker"], "lines": samples[row["speaker"]]} for row in pending]
         def metadata_item(speaker: str) -> dict[str, Any]:
             return {
                 "type": "object",
@@ -254,49 +253,59 @@ class StageExecutor:
                 "required": ["speaker", "gender", "personality"],
                 "additionalProperties": False,
             }
-        response = client.chat.completions.create(
-            model=settings.get("llm_model", "local-model"),
-            messages=[
-                {"role": "system", "content": "Return only a JSON array. Infer audiobook character metadata from quoted lines. Use 未知 when gender cannot be inferred."},
-                {"role": "user", "content": "For every character return speaker, gender, and one concise Chinese personality sentence. Keep speaker exact; do not omit or add characters.\n" + json.dumps(payload, ensure_ascii=False)},
-            ],
-            temperature=0.2,
-            max_tokens=4096,
-            reasoning_effort="none",
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "character_metadata",
-                    "strict": True,
-                    "schema": {
-                        "type": "array",
-                        "prefixItems": [metadata_item(row["speaker"]) for row in pending],
-                        "minItems": len(pending),
-                        "maxItems": len(pending),
+        for offset in range(0, len(pending), 25):
+            batch = pending[offset:offset + 25]
+            payload = [{"speaker": row["speaker"], "lines": samples[row["speaker"]]} for row in batch]
+            response = client.chat.completions.create(
+                model=settings.get("llm_model", "local-model"),
+                messages=[
+                    {"role": "system", "content": "Return only a JSON array. Infer audiobook character metadata from quoted lines. Use 未知 when gender cannot be inferred."},
+                    {"role": "user", "content": "For every character return speaker, gender, and one concise Chinese personality sentence. Keep speaker exact; do not omit or add characters.\n" + json.dumps(payload, ensure_ascii=False)},
+                ],
+                temperature=0.2,
+                max_tokens=4096,
+                reasoning_effort="none",
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "character_metadata",
+                        "strict": True,
+                        "schema": {
+                            "type": "array",
+                            "prefixItems": [metadata_item(row["speaker"]) for row in batch],
+                            "minItems": len(batch),
+                            "maxItems": len(batch),
+                        },
                     },
                 },
-            },
-        )
-        text = (response.choices[0].message.content or "").strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-        parsed = json.loads(text)
-        if not isinstance(parsed, list):
-            raise ValueError("Character analysis did not return a JSON array")
-        allowed = [row["speaker"] for row in pending]
-        if any(not isinstance(row, dict) for row in parsed):
-            raise ValueError("Character analysis contains a non-object entry")
-        speakers = [row.get("speaker") for row in parsed]
-        if len(speakers) != len(set(speakers)) or set(speakers) != set(allowed):
-            raise ValueError("Character analysis must return every requested speaker exactly once")
-        updates = []
-        for row in parsed:
-            gender = row.get("gender")
-            personality = row.get("personality")
-            if not isinstance(gender, str) or not gender.strip() or not isinstance(personality, str) or not personality.strip():
-                raise ValueError(f"Character analysis is incomplete for {row.get('speaker', '')}")
-            updates.append({"speaker": row["speaker"], "gender": gender, "personality": personality})
-        return self.repo.update_characters(project["id"], updates, automated=True)
+            )
+            text = (response.choices[0].message.content or "").strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            parsed = json.loads(text)
+            if not isinstance(parsed, list):
+                raise ValueError("Character analysis did not return a JSON array")
+            allowed = [row["speaker"] for row in batch]
+            if any(not isinstance(row, dict) for row in parsed):
+                raise ValueError("Character analysis contains a non-object entry")
+            speakers = [row.get("speaker") for row in parsed]
+            if len(speakers) != len(set(speakers)) or set(speakers) != set(allowed):
+                raise ValueError("Character analysis must return every requested speaker exactly once")
+            updates = []
+            by_speaker = {row["speaker"]: row for row in batch}
+            for row in parsed:
+                gender = row.get("gender")
+                personality = row.get("personality")
+                if not isinstance(gender, str) or not gender.strip() or not isinstance(personality, str) or not personality.strip():
+                    raise ValueError(f"Character analysis is incomplete for {row.get('speaker', '')}")
+                current = by_speaker[row["speaker"]]
+                updates.append({
+                    "speaker": row["speaker"],
+                    "gender": current["gender"] or gender,
+                    "personality": current["personality"] or personality,
+                })
+            self.repo.update_characters(project["id"], updates, automated=True)
+        return self.repo.list_characters(project["id"])
 
     def render(
         self,
@@ -422,7 +431,8 @@ class StageExecutor:
 
         check_stop()
         ordered_entries = sorted(script["entries"], key=lambda row: row["position"])
-        chapter_output = self.repo.storage_root / "projects" / project["id"] / "output" / f"{chapter.position:04d}-{_slug(chapter.title)}.mp3"
+        chapter_data = next(row for row in self.repo.list_included_chapters(project["id"]) if row["id"] == chapter_id)
+        chapter_output = self.repo.storage_root / "projects" / project["id"] / "output" / f"{chapter_data['included_position']:04d}-{_slug(chapter.title)}.mp3"
         merge_mp3(
             [files[row["position"]] for row in ordered_entries],
             chapter_output,
@@ -434,7 +444,7 @@ class StageExecutor:
     def merge_book(self, project: dict[str, Any], log: LogCallback) -> Path:
         from tools.render_book import concat_mp3
 
-        chapters = self.repo.list_chapters(project["id"])
+        chapters = self.repo.list_included_chapters(project["id"])
         artifacts = self.repo.list_artifacts(project["id"])
         by_chapter = {row["chapter_id"]: self.repo.storage_root / row["path"] for row in artifacts if row["kind"] == "chapter_mp3"}
         missing = [

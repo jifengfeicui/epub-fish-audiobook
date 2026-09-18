@@ -131,6 +131,8 @@ class Repository:
         settings = project.settings
         counts: dict[str, int] = {}
         for chapter in project.chapters:
+            if not chapter.included:
+                continue
             counts[chapter.status] = counts.get(chapter.status, 0) + 1
         return {
             "id": project.id,
@@ -138,6 +140,7 @@ class Repository:
             "source_filename": project.source_filename,
             "status": project.status,
             "chapter_count": len(project.chapters),
+            "included_chapter_count": sum(chapter.included for chapter in project.chapters),
             "chapter_status_counts": counts,
             "created_at": _iso(project.created_at),
             "updated_at": _iso(project.updated_at),
@@ -198,6 +201,10 @@ class Repository:
     def reparse_project(self, project_id: str) -> dict[str, Any]:
         from tools.render_book import inspect_book
 
+        bilibili_dir = self.storage_root / "projects" / project_id / "bilibili"
+        if self._has_bilibili_publication(project_id):
+            raise RuntimeError("bilibili_publication_exists")
+
         with self.db.session() as session:
             record = session.get(Project, project_id)
             if record is None:
@@ -235,26 +242,84 @@ class Repository:
         project_dir = self.storage_root / "projects" / project_id
         for name in ("audio", "work", "output"):
             shutil.rmtree(project_dir / name, ignore_errors=True)
+        shutil.rmtree(bilibili_dir, ignore_errors=True)
         return self.get_project(project_id)
 
     def list_chapters(self, project_id: str) -> list[dict[str, Any]]:
         with self.db.session() as session:
             rows = session.scalars(select(Chapter).where(Chapter.project_id == project_id).order_by(Chapter.position)).all()
-            return [self.chapter_dict(row) for row in rows]
+            included_position = 0
+            result = []
+            for row in rows:
+                if row.included:
+                    included_position += 1
+                result.append(self.chapter_dict(row, included_position if row.included else None))
+            return result
 
-    def list_selected_chapters(self, project_id: str) -> list[dict[str, Any]]:
-        project = self.get_project(project_id)
-        start = project["settings"]["from_chapter"] or 1
-        end = project["settings"]["to_chapter"] or project["chapter_count"]
-        return [row for row in self.list_chapters(project_id) if start <= row["position"] <= end]
+    def list_included_chapters(self, project_id: str) -> list[dict[str, Any]]:
+        return [row for row in self.list_chapters(project_id) if row["included"]]
+
+    def list_selected_chapters(self, project_id: str, payload: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        chapters = self.list_included_chapters(project_id)
+        payload = payload or {}
+        try:
+            start_value = payload.get("from_included_position")
+            end_value = payload.get("to_included_position")
+            start = 1 if start_value is None else int(start_value)
+            end = len(chapters) if end_value is None else int(end_value)
+        except (TypeError, ValueError):
+            raise RuntimeError("invalid_chapter_range") from None
+        if start < 1 or end < start or end > len(chapters):
+            raise RuntimeError("invalid_chapter_range")
+        return [row for row in chapters if start <= row["included_position"] <= end]
+
+    def _has_bilibili_publication(self, project_id: str) -> bool:
+        try:
+            manifest = json.loads((self.storage_root / "projects" / project_id / "bilibili" / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return bool(manifest.get("publication", {}).get("bvid"))
+
+    def set_chapter_inclusion(self, project_id: str, included_chapter_ids: list[int]) -> list[dict[str, Any]]:
+        included = set(included_chapter_ids)
+        if not included:
+            raise RuntimeError("no_included_chapters")
+        if self._has_bilibili_publication(project_id):
+            raise RuntimeError("bilibili_publication_exists")
+        with self.db.session() as session, session.begin():
+            project = session.get(Project, project_id)
+            if project is None:
+                raise KeyError(project_id)
+            active = session.scalar(
+                select(Job.id).where(Job.project_id == project_id, Job.status.in_(ACTIVE_JOB_STATES)).limit(1)
+            )
+            if active:
+                raise RuntimeError("project_running")
+            chapters = session.scalars(
+                select(Chapter).where(Chapter.project_id == project_id).order_by(Chapter.position)
+            ).all()
+            if not included.issubset({chapter.id for chapter in chapters}):
+                raise RuntimeError("invalid_chapter_ids")
+            for chapter in chapters:
+                chapter.included = chapter.id in included
+            session.execute(update(Artifact).where(
+                Artifact.project_id == project_id,
+                Artifact.chapter_id.is_(None),
+                Artifact.status == "active",
+            ).values(status="stale"))
+            project.updated_at = utcnow()
+        self.refresh_characters(project_id)
+        return self.list_chapters(project_id)
 
     @staticmethod
-    def chapter_dict(chapter: Chapter) -> dict[str, Any]:
+    def chapter_dict(chapter: Chapter, included_position: int | None = None) -> dict[str, Any]:
         return {
             "id": chapter.id,
             "project_id": chapter.project_id,
             "position": chapter.position,
+            "included_position": included_position,
             "title": chapter.title,
+            "included": chapter.included,
             "status": chapter.status,
             "active_revision_id": chapter.active_revision_id,
         }
@@ -350,12 +415,12 @@ class Repository:
             project.updated_at = utcnow()
         return result
 
-    def create_job(self, project_id: str, job_type: str = "preprocess") -> dict[str, Any]:
+    def create_job(self, project_id: str, job_type: str = "preprocess", payload: dict[str, Any] | None = None) -> dict[str, Any]:
         with self._job_lock:
-            return self._create_job(project_id, job_type)
+            return self._create_job(project_id, job_type, payload or {})
 
-    def _create_job(self, project_id: str, job_type: str) -> dict[str, Any]:
-        if job_type not in ("preprocess", "render", "merge"):
+    def _create_job(self, project_id: str, job_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if job_type not in ("preprocess", "render", "merge", "bilibili", "character_analysis"):
             raise ValueError("Invalid job type")
         with self.db.session() as session, session.begin():
             project = session.get(Project, project_id)
@@ -370,7 +435,7 @@ class Repository:
             if resumable:
                 raise RuntimeError("resumable_job")
             if job_type == "render":
-                chapters = self.list_selected_chapters(project_id)
+                chapters = self.list_selected_chapters(project_id, payload)
                 ready = 0
                 for chapter in chapters:
                     record = session.get(Chapter, chapter["id"])
@@ -380,7 +445,7 @@ class Repository:
                     raise RuntimeError("render_not_ready")
             elif job_type == "merge":
                 chapter_ids = set(session.scalars(
-                    select(Chapter.id).where(Chapter.project_id == project_id)
+                    select(Chapter.id).where(Chapter.project_id == project_id, Chapter.included.is_(True))
                 ).all())
                 artifacts = session.scalars(select(Artifact).where(
                     Artifact.project_id == project_id,
@@ -398,6 +463,7 @@ class Repository:
                 id=str(uuid.uuid4()),
                 project_id=project_id,
                 job_type=job_type,
+                payload_json=json.dumps(payload, ensure_ascii=False),
                 status="queued",
                 render_start_mode=project.settings.render_start_mode,
                 release_batch_size=project.settings.release_batch_size,
@@ -427,6 +493,7 @@ class Repository:
             "id": job.id,
             "project_id": job.project_id,
             "type": job.job_type,
+            "payload": json.loads(job.payload_json or "{}"),
             "status": job.status,
             "render_start_mode": job.render_start_mode,
             "release_batch_size": job.release_batch_size,
@@ -890,7 +957,9 @@ class Repository:
 
     def refresh_characters(self, project_id: str) -> list[dict[str, Any]]:
         with self.db.session() as session, session.begin():
-            chapters = session.scalars(select(Chapter).where(Chapter.project_id == project_id).order_by(Chapter.position)).all()
+            chapters = session.scalars(select(Chapter).where(
+                Chapter.project_id == project_id, Chapter.included.is_(True)
+            ).order_by(Chapter.position)).all()
             stats: dict[str, dict[str, Any]] = {}
             seen = 0
             for chapter in chapters:
@@ -951,7 +1020,9 @@ class Repository:
         wanted = set(speakers)
         samples = {speaker: [] for speaker in speakers}
         with self.db.session() as session:
-            chapters = session.scalars(select(Chapter).where(Chapter.project_id == project_id).order_by(Chapter.position)).all()
+            chapters = session.scalars(select(Chapter).where(
+                Chapter.project_id == project_id, Chapter.included.is_(True)
+            ).order_by(Chapter.position)).all()
             for chapter in chapters:
                 if not chapter.active_revision_id:
                     continue
@@ -981,13 +1052,15 @@ class Repository:
                     SpeakerAssignment.project_id == project_id,
                     SpeakerAssignment.speaker == values["speaker"],
                 ))
-                if row is None or (automated and row.user_edited):
+                if row is None:
                     continue
                 voice_id = values.get("voice_profile_id")
                 if voice_id and (voice_id not in voices or voice_id == narrator_voice_id):
                     raise RuntimeError("Character voices must come from the unbound Fish voice pool")
-                row.gender = values.get("gender", "").strip()
-                row.personality = values.get("personality", "").strip()
+                if not automated or not row.gender:
+                    row.gender = values.get("gender", "").strip()
+                if not automated or not row.personality:
+                    row.personality = values.get("personality", "").strip()
                 if not automated:
                     row.voice_profile_id = voice_id or None
                     row.user_edited = True
@@ -1085,5 +1158,5 @@ class Repository:
             row = session.get(Artifact, artifact_id)
             if row is None or row.status != "active":
                 raise KeyError(artifact_id)
-            data = {"id": row.id, "kind": row.kind, "path": row.path}
+            data = {"id": row.id, "project_id": row.project_id, "chapter_id": row.chapter_id, "kind": row.kind, "path": row.path}
             return data, (self.storage_root / row.path).resolve()

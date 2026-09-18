@@ -33,8 +33,9 @@ export const useProjectsStore = defineStore('projects', () => {
       api.get<Array<{ speaker: string; voice_name: string; reference_id: string }>>(`/api/v1/projects/${id}/speaker-assignments`),
       api.get<Character[]>(`/api/v1/projects/${id}/characters`),
     ])
+    chapters.value = chapterRows.map(chapter => ({ ...chapter, included: chapter.included ?? true }))
+    project.included_chapter_count ??= chapters.value.filter(chapter => chapter.included).length
     current.value = project
-    chapters.value = chapterRows
     artifacts.value = artifactRows
     const mergedEvents = [...previousEvents, ...eventRows]
     events.value = Array.from(new Map(mergedEvents.map(event => [event.event_id, event])).values())

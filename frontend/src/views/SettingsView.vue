@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
-import { CircleCheck, KeyRound, LoaderCircle, MessageSquareText, Mic2, Play, Plus, Save, Server, SlidersHorizontal, Trash2, X } from 'lucide-vue-next'
+import { CircleCheck, KeyRound, LoaderCircle, MessageSquareText, Mic2, Play, Plus, Save, Server, SlidersHorizontal, Trash2, Tv, X } from 'lucide-vue-next'
+import QrcodeVue from 'qrcode.vue'
 import { api } from '../api/client'
 
 interface VoiceProfile {
@@ -52,12 +53,16 @@ const form = ref<AppSettings>({
 const voices = ref<VoiceProfile[]>([])
 const saved = ref(false)
 const error = ref('')
-const activeSection = ref<'connections' | 'rendering' | 'prompts' | 'voices'>('connections')
+const activeSection = ref<'connections' | 'rendering' | 'prompts' | 'voices' | 'bilibili'>('connections')
 const showAddVoice = ref(false)
 const newReferenceId = ref('')
 const addVoiceError = ref('')
 const addingVoice = ref(false)
 let previewAudio: HTMLAudioElement | null = null
+const bilibiliAccount = ref<{ logged_in: boolean; name: string | null }>({ logged_in: false, name: null })
+const qrLogin = ref<{ session_id: string; url: string; expires_at: string } | null>(null)
+const qrStatus = ref('')
+let loginTimer = 0
 
 onMounted(async () => {
   const [settings, profiles] = await Promise.all([
@@ -69,7 +74,33 @@ onMounted(async () => {
     profile.enabled ??= true
     return profile
   })
+  bilibiliAccount.value = await api.get<{ logged_in: boolean; name: string | null }>('/api/v1/bilibili/account').catch(() => ({ logged_in: false, name: null }))
 })
+
+async function pollBilibiliLogin() {
+  if (!qrLogin.value) return
+  try {
+    const result = await api.get<{ status: 'pending' | 'success' | 'expired'; name: string | null }>(`/api/v1/bilibili/login/${qrLogin.value.session_id}`)
+    qrStatus.value = result.status === 'pending' ? '等待扫码确认' : result.status === 'success' ? '登录成功' : '二维码已过期'
+    if (result.status === 'success') {
+      bilibiliAccount.value = { logged_in: true, name: result.name }
+      qrLogin.value = null
+      return
+    }
+    if (result.status === 'expired') return
+    loginTimer = window.setTimeout(pollBilibiliLogin, 2000)
+  } catch (reason) { qrStatus.value = (reason as Error).message }
+}
+
+async function startBilibiliLogin() {
+  window.clearTimeout(loginTimer)
+  error.value = ''
+  try {
+    qrLogin.value = await api.post('/api/v1/bilibili/login')
+    qrStatus.value = '等待扫码确认'
+    loginTimer = window.setTimeout(pollBilibiliLogin, 1500)
+  } catch (reason) { error.value = (reason as Error).message }
+}
 
 function openAddVoice() {
   newReferenceId.value = ''
@@ -131,7 +162,7 @@ function playSample(voice: VoiceProfile) {
   void previewAudio.play()
 }
 
-onBeforeUnmount(() => previewAudio?.pause())
+onBeforeUnmount(() => { previewAudio?.pause(); window.clearTimeout(loginTimer) })
 
 async function save() {
   error.value = ''
@@ -157,9 +188,10 @@ async function save() {
         <button :class="{ active: activeSection === 'rendering' }" @click="activeSection = 'rendering'"><SlidersHorizontal :size="17" /><span>生成参数</span></button>
         <button :class="{ active: activeSection === 'prompts' }" @click="activeSection = 'prompts'"><MessageSquareText :size="17" /><span>Prompt</span></button>
         <button :class="{ active: activeSection === 'voices' }" @click="activeSection = 'voices'"><Mic2 :size="17" /><span>音色池</span></button>
+        <button :class="{ active: activeSection === 'bilibili' }" @click="activeSection = 'bilibili'"><Tv :size="17" /><span>B站账号</span></button>
       </nav>
       <div class="section-content settings-content">
-        <div class="settings-savebar">
+        <div v-if="activeSection !== 'bilibili'" class="settings-savebar">
           <span v-if="saved" class="success-text">设置已保存</span>
           <button class="button primary" @click="save"><Save :size="17" />保存设置与音色</button>
         </div>
@@ -203,7 +235,7 @@ async function save() {
             <label>Review User<textarea v-model="form.prompts.review_user_prompt" rows="8" /></label>
           </div>
         </section>
-        <section v-else class="panel voices-card">
+        <section v-else-if="activeSection === 'voices'" class="panel voices-card">
           <div class="panel-heading"><div><h2>Fish 音色池</h2><span class="muted">管理全局可用音色；旁白与角色音色均在项目中选择</span></div><button class="button secondary" @click="openAddVoice"><Plus :size="15" />添加音色</button></div>
           <div class="voice-table">
             <div class="voice-row voice-head"><span>显示名称</span><span>Fish Reference ID</span><span>性别</span><span>备注</span><span>状态</span><span>操作</span></div>
@@ -219,6 +251,12 @@ async function save() {
             </div>
             <p v-if="!voices.length" class="empty-voices">还没有配置音色，开始渲染前至少添加一个。</p>
           </div>
+        </section>
+        <section v-else class="panel bilibili-account-card">
+          <div class="panel-heading"><div><h2>B站账号</h2><span class="muted">凭据仅保存在本机 data/secrets，不会返回浏览器</span></div><Tv :size="20" /></div>
+          <div class="account-status"><CircleCheck v-if="bilibiliAccount.logged_in" :size="19" /><span><strong>{{ bilibiliAccount.logged_in ? bilibiliAccount.name || '已登录' : '未登录' }}</strong><small>{{ bilibiliAccount.logged_in ? '账号校验有效' : '扫码后可使用投稿功能' }}</small></span></div>
+          <div v-if="qrLogin" class="qr-login"><QrcodeVue :value="qrLogin.url" :size="220" level="M" /><strong>{{ qrStatus }}</strong></div>
+          <button class="button primary" @click="startBilibiliLogin"><Tv :size="16" />{{ bilibiliAccount.logged_in ? '重新扫码登录' : '扫码登录' }}</button>
         </section>
       </div>
     </div>

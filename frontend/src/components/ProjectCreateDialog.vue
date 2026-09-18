@@ -7,8 +7,6 @@ import type { Project } from '../types'
 const emit = defineEmits<{ close: []; created: [project: Project] }>()
 const title = ref('')
 const file = ref<File | null>(null)
-const fromChapter = ref<number | '' | null>(null)
-const toChapter = ref<number | '' | null>(null)
 const busy = ref(false)
 const error = ref('')
 
@@ -19,8 +17,6 @@ async function submit() {
   const form = new FormData()
   form.append('file', file.value)
   form.append('title', title.value)
-  if (fromChapter.value !== null && fromChapter.value !== '') form.append('from_chapter', String(fromChapter.value))
-  if (toChapter.value !== null && toChapter.value !== '') form.append('to_chapter', String(toChapter.value))
   try { emit('created', await api.upload<Project>('/api/v1/projects', form)) }
   catch (reason) { error.value = (reason as Error).message }
   finally { busy.value = false }
@@ -39,8 +35,6 @@ async function submit() {
       </label>
       <div class="form-grid">
         <label class="span-2">项目名称<input v-model="title" placeholder="默认使用文件名" /></label>
-        <label>起始章节<input v-model.number="fromChapter" type="number" min="1" placeholder="第 1 章" /></label>
-        <label>结束章节<input v-model.number="toChapter" type="number" min="1" placeholder="最后一章" /></label>
       </div>
       <p v-if="error" class="form-error">{{ error }}</p>
       <footer><button class="button secondary" @click="emit('close')">取消</button><button class="button primary" :disabled="busy" @click="submit">{{ busy ? '正在导入...' : '创建项目' }}</button></footer>
