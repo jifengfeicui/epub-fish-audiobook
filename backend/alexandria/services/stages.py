@@ -321,9 +321,12 @@ class StageExecutor:
         from tools.render_book import merge_mp3
 
         chapter = self.repo.get_chapter_record(chapter_id)
+        chapter_data = next(row for row in self.repo.list_included_chapters(project["id"]) if row["id"] == chapter_id)
+        included_position = chapter_data["included_position"]
         script = self.repo.get_script(chapter_id)
         if not script["entries"]:
             raise RuntimeError(f"Chapter {chapter.position} has no reviewed script")
+        segment_total = len(script["entries"])
         speakers = list(dict.fromkeys(entry["speaker"] for entry in script["entries"]))
         voices = self.repo.assign_voices(project["id"], speakers)
         settings = self.repo.get_settings(reveal_secrets=True)
@@ -354,7 +357,7 @@ class StageExecutor:
             reusable = self.repo.reusable_audio_segment(chapter_id, position, fingerprint)
             if reusable:
                 check_stop()
-                log(f"第 {chapter.position} 章片段 {position} 使用缓存")
+                log(f"第 {included_position} 章片段 {position} / {segment_total} 使用缓存")
                 return position, self.repo.storage_root / reusable, fingerprint, 0
             try:
                 check_stop()
@@ -393,7 +396,7 @@ class StageExecutor:
                 )
                 raise
             check_stop()
-            log(f"第 {chapter.position} 章片段 {position} 已渲染")
+            log(f"第 {included_position} 章片段 {position} / {segment_total} 已渲染")
             return position, output, fingerprint, result.attempts
 
         files: dict[int, Path] = {}
@@ -431,8 +434,7 @@ class StageExecutor:
 
         check_stop()
         ordered_entries = sorted(script["entries"], key=lambda row: row["position"])
-        chapter_data = next(row for row in self.repo.list_included_chapters(project["id"]) if row["id"] == chapter_id)
-        chapter_output = self.repo.storage_root / "projects" / project["id"] / "output" / f"{chapter_data['included_position']:04d}-{_slug(chapter.title)}.mp3"
+        chapter_output = self.repo.storage_root / "projects" / project["id"] / "output" / f"{included_position:04d}-{_slug(chapter.title)}.mp3"
         merge_mp3(
             [files[row["position"]] for row in ordered_entries],
             chapter_output,

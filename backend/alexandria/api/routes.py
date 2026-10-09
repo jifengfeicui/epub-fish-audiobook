@@ -8,7 +8,7 @@ import aiofiles
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 
-from backend.alexandria.api.schemas import BilibiliJobCreate, ChapterListUpdate, CharacterListUpdate, JobCreate, ProjectUpdate, ProjectVoicePoolUpdate, ScriptUpdate, SettingsUpdate, VoiceListUpdate, VoiceValidationInput
+from backend.alexandria.api.schemas import BilibiliJobCreate, BilibiliReconcile, ChapterListUpdate, CharacterListUpdate, JobCreate, ProjectUpdate, ProjectVoicePoolUpdate, ScriptUpdate, SettingsUpdate, VoiceListUpdate, VoiceValidationInput
 from backend.alexandria.db.repository import Repository
 from backend.alexandria.domain.pipeline import RENDER_START_MODES
 
@@ -24,8 +24,7 @@ def _http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, KeyError):
         return HTTPException(status_code=404, detail="Resource not found")
     mapping = {
-        "active_job": (409, "Another audiobook job is already running"),
-        "resumable_job": (409, "This project has a paused or interrupted job; resume it instead"),
+        "active_job": (409, "另一个任务正在运行"),
         "revision_conflict": (409, "The script changed; reload before saving"),
         "project_running": (409, "Pause the project before editing its script"),
         "script_not_editable": (409, "Scripts can only be edited while a job is paused or completed"),
@@ -44,6 +43,10 @@ def _http_error(exc: Exception) -> HTTPException:
         "narrator_voice_unavailable": (409, "The project narrator must be an enabled voice in the project pool"),
         "bilibili_publication_exists": (409, "已投稿的项目不能重新识别章节"),
         "bilibili_not_logged_in": (409, "请先在设置中登录B站账号"),
+        "bilibili_login_blocked": (502, "B站拒绝了登录请求，请稍后重试"),
+        "bilibili_login_start_failed": (502, "创建B站登录二维码失败，请稍后重试"),
+        "bilibili_login_poll_failed": (502, "检查B站登录状态失败，请稍后重试"),
+        "bilibili_metadata_failed": (502, "书籍元数据提取失败"),
         "bilibili_no_continuous_audio": (409, "还没有从首章开始连续生成的章节音频"),
         "bilibili_not_prepared": (409, "请先准备章节视频"),
         "bilibili_already_published": (409, "该项目已经首发，请使用追加"),
@@ -52,8 +55,16 @@ def _http_error(exc: Exception) -> HTTPException:
         "bilibili_public_confirmation_required": (422, "公开投稿需要二次确认"),
         "bilibili_source_required": (422, "转载来源不能为空"),
         "bilibili_invalid_parts": (422, "分P数量超出当前可用范围"),
+        "bilibili_reconcile_required": (409, "B站远端状态不确定，请先校准投稿"),
+        "bilibili_reconcile_mismatch": (409, "BV稿件与本地视频无法匹配，请检查后重试"),
     }
     message = str(exc)
+    if message.startswith("job_exists:"):
+        return HTTPException(status_code=409, detail={
+            "code": "job_exists",
+            "message": "同类任务已存在，请继续、重试或取消原任务",
+            "job_id": message.split(":", 1)[1],
+        })
     key = next((item for item in mapping if message == item or message.startswith(f"{item}:")), None)
     status, detail = mapping.get(key, (400, message))
     if key and message != key:
@@ -229,10 +240,17 @@ def pause_job(job_id: str, request: Request):
 
 
 @router.post("/jobs/{job_id}/resume")
-@router.post("/jobs/{job_id}/retry")
 def resume_job(job_id: str, request: Request):
     try:
         return _repo(request).resume_job(job_id)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/jobs/{job_id}/retry")
+def retry_job(job_id: str, request: Request):
+    try:
+        return _repo(request).retry_job(job_id)
     except Exception as exc:
         raise _http_error(exc) from exc
 
@@ -246,7 +264,7 @@ def cancel_job(job_id: str, request: Request):
 
 
 @router.get("/projects/{project_id}/events")
-def list_events(project_id: str, request: Request, after: int = 0):
+def list_events(project_id: str, request: Request, after: int | None = None):
     return _repo(request).list_events(project_id, after=after)
 
 
@@ -280,6 +298,15 @@ def bilibili_login(request: Request):
         raise _http_error(exc) from exc
 
 
+@router.post("/projects/{project_id}/bilibili/metadata")
+def bilibili_metadata(project_id: str, request: Request):
+    try:
+        _repo(request).get_project(project_id)
+        return request.app.state.bilibili.extract_metadata(project_id)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
 @router.get("/bilibili/login/{session_id}")
 def bilibili_login_poll(session_id: str, request: Request):
     try:
@@ -289,9 +316,9 @@ def bilibili_login_poll(session_id: str, request: Request):
 
 
 @router.get("/projects/{project_id}/bilibili")
-def bilibili_status(project_id: str, request: Request):
+def bilibili_status(project_id: str, request: Request, sync_remote: bool = True):
     try:
-        return request.app.state.bilibili.status(project_id)
+        return request.app.state.bilibili.status(project_id, sync_remote=sync_remote)
     except Exception as exc:
         raise _http_error(exc) from exc
 

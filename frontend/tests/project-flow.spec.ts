@@ -1,5 +1,37 @@
 import { expect, test } from '@playwright/test'
 
+test('append progress tracks this batch and waits for remote confirmation', async ({ page }) => {
+  const job = { id: 'append-job', type: 'bilibili', status: 'running', payload: { action: 'append', parts: 10, uploaded_parts: 0 } }
+  const chapters = [1, 2, 3].map(position => ({ id: position, position, included: true, included_position: position, title: `第${position}章`, status: 'done' }))
+  const project = { id: 'book-1', title: '测试书', status: 'running', source_filename: 'book.epub', latest_job: job, settings: {}, chapter_count: 3 }
+  await page.route('**/api/v1/**', route => {
+    const path = new URL(route.request().url()).pathname
+    const responses: Record<string, unknown> = {
+      '/api/v1/projects/book-1': project,
+      '/api/v1/projects/book-1/chapters': chapters,
+      '/api/v1/projects/book-1/bilibili': { continuous_audio_count: 3, prepared_count: 3, published_count: 3, appendable_count: 0, chapters: [], form: {}, publication: { bvid: 'BV1234567890', remote_count: 3 } },
+      '/api/v1/projects/book-1/voice-pool': { excluded_voice_ids: [], narrator_voice_profile_id: null },
+      '/api/v1/chapters/1/script': { revision: 0, entries: [] },
+    }
+    return route.fulfill({ json: responses[path] ?? [] })
+  })
+  await page.goto('/projects/book-1')
+  await expect(page.locator('.progress-copy strong')).toHaveText('0%')
+  await expect(page.getByText('本次已上传 0/10 个分P', { exact: true })).toBeVisible()
+  job.payload.uploaded_parts = 4
+  await page.reload()
+  await expect(page.locator('.progress-copy strong')).toHaveText('40%')
+  await expect(page.getByText('本次已上传 4/10 个分P', { exact: true })).toBeVisible()
+  job.payload.uploaded_parts = 10
+  await page.reload()
+  await expect(page.locator('.progress-copy strong')).toHaveText('99%')
+  await expect(page.getByText('本次已上传 10/10 个分P，等待远端确认', { exact: true })).toBeVisible()
+  job.status = 'completed'
+  await page.reload()
+  await expect(page.locator('.progress-copy strong')).toHaveText('100%')
+  await expect(page.getByText('本次 10/10 个分P已获远端确认', { exact: true })).toBeVisible()
+})
+
 test('opens a project and keeps preprocessing separate from TTS', async ({ page }) => {
   let status = 'ready'
   let savedPool: { excluded_voice_ids: string[]; narrator_voice_profile_id: string | null } | undefined
@@ -16,6 +48,7 @@ test('opens a project and keeps preprocessing separate from TTS', async ({ page 
   await page.route('**/api/v1/projects/book-1/events', route => route.fulfill({ json: [] }))
   await page.route('**/api/v1/projects/book-1/speaker-assignments', route => route.fulfill({ json: [] }))
   await page.route('**/api/v1/projects/book-1/characters', route => route.fulfill({ json: [] }))
+  await page.route(/\/api\/v1\/projects\/book-1\/bilibili(?:\?.*)?$/, route => route.fulfill({ json: { continuous_audio_count: 0, prepared_count: 0, published_count: 0, appendable_count: 0, form: {}, publication: null, chapters: [] } }))
   await page.route('**/api/v1/voices', route => route.fulfill({ json: [
     { id: 'voice-1', name: '旁白一', gender: '女', traits: '沉稳', enabled: true, sample_available: true, sample_url: '/sample.wav' },
     { id: 'voice-2', name: '旁白二', gender: '男', traits: '清晰', enabled: true, sample_available: false, sample_url: null },
@@ -69,6 +102,7 @@ test('selects a temporary TTS range and starts a merge job when every chapter ha
   await page.route('**/api/v1/projects/book-1/events', route => route.fulfill({ json: [] }))
   await page.route('**/api/v1/projects/book-1/speaker-assignments', route => route.fulfill({ json: [] }))
   await page.route('**/api/v1/projects/book-1/characters', route => route.fulfill({ json: [] }))
+  await page.route(/\/api\/v1\/projects\/book-1\/bilibili(?:\?.*)?$/, route => route.fulfill({ json: { continuous_audio_count: 2, prepared_count: 0, published_count: 0, appendable_count: 0, form: {}, publication: null, chapters: [] } }))
   await page.route('**/api/v1/voices', route => route.fulfill({ json: [{ id: 'voice-1', name: '旁白', gender: '女', traits: '', enabled: true, sample_available: false, sample_url: null }] }))
   await page.route('**/api/v1/projects/book-1/voice-pool', route => route.fulfill({ json: { excluded_voice_ids: [], narrator_voice_profile_id: 'voice-1' } }))
   await page.route('**/api/v1/chapters/1/script', route => route.fulfill({ json: { chapter_id: 1, revision: 1, kind: 'reviewed', entries: [] } }))
@@ -114,6 +148,7 @@ test('excludes a chapter while keeping it visible', async ({ page }) => {
   await page.route('**/api/v1/projects/book-exclusion/events', route => route.fulfill({ json: [] }))
   await page.route('**/api/v1/projects/book-exclusion/speaker-assignments', route => route.fulfill({ json: [] }))
   await page.route('**/api/v1/projects/book-exclusion/characters', route => route.fulfill({ json: [] }))
+  await page.route(/\/api\/v1\/projects\/book-exclusion\/bilibili(?:\?.*)?$/, route => route.fulfill({ json: { continuous_audio_count: 0, prepared_count: 0, published_count: 0, appendable_count: 0, form: {}, publication: null, chapters: [] } }))
   await page.route('**/api/v1/projects/book-exclusion/voice-pool', route => route.fulfill({ json: { excluded_voice_ids: [], narrator_voice_profile_id: null } }))
   await page.route('**/api/v1/voices', route => route.fulfill({ json: [] }))
   await page.route('**/api/v1/chapters/*/script', route => route.fulfill({ json: { chapter_id: 1, revision: 1, kind: 'reviewed', entries: [] } }))
@@ -152,12 +187,13 @@ test('publishes a private-ready prefix with public confirmation and validates ap
   await page.route('**/api/v1/projects/book-1/voice-pool', route => route.fulfill({ json: { excluded_voice_ids: [], narrator_voice_profile_id: null } }))
   await page.route('**/api/v1/voices', route => route.fulfill({ json: [] }))
   await page.route('**/api/v1/chapters/1/script', route => route.fulfill({ json: { chapter_id: 1, revision: 0, kind: null, entries: [] } }))
-  await page.route('**/api/v1/projects/book-1/bilibili', route => route.fulfill({ json: {
+  await page.route(/\/api\/v1\/projects\/book-1\/bilibili(?:\?.*)?$/, route => route.fulfill({ json: {
     continuous_audio_count: 2, prepared_count: 2, published_count: published ? 1 : 0, appendable_count: published ? 1 : 2,
     form: { author: '', publisher: '', source: '测试来源', title: '《测试有声书》AI有声书', tid: 201, tags: '有声书,读书', desc: '按章节分P', visibility: 'only_self', line: 'cnbldsa' },
     publication: published ? { bvid: 'BV1234567890' } : null,
     chapters: chapters.map(chapter => ({ ...chapter, bilibili_state: chapter.position === 1 && published ? 'published' : chapter.position < 3 ? 'ready' : 'missing', image_url: null, video_url: null })),
   } }))
+  await page.route('**/api/v1/projects/book-1/bilibili/metadata', route => route.fulfill({ json: { author: '书中作者', publisher: '书中出版社', description: 'LLM简介' } }))
   await page.route('**/api/v1/projects/book-1/bilibili/jobs', async route => {
     const body = await route.request().postDataJSON()
     jobs.push(body)
@@ -166,8 +202,14 @@ test('publishes a private-ready prefix with public confirmation and validates ap
   })
 
   await page.goto('/projects/book-1')
+  await expect(page.getByText('准备视频：2/3')).toBeVisible()
+  await expect(page.getByText('发布：0/3')).toBeVisible()
   await page.getByRole('button', { name: 'B站投稿' }).click()
   await expect(page.getByText('连续音频')).toBeVisible()
+  await page.getByRole('button', { name: '从书籍提取' }).click()
+  await expect(page.getByLabel('作者')).toHaveValue('书中作者')
+  await expect(page.getByLabel('出版社')).toHaveValue('书中出版社')
+  await expect(page.getByLabel('简介')).toHaveValue('按章节分P')
   await page.getByLabel('可见性').selectOption('public')
   page.once('dialog', dialog => dialog.accept())
   await page.getByRole('button', { name: '首发' }).click()

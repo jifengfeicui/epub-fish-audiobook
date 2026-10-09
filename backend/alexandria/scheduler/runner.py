@@ -46,7 +46,7 @@ class PipelineRunner:
                 if current["status"] != "cancelled":
                     self.repo.set_job_status(job_id, "paused")
             else:
-                self.repo.set_job_status(job_id, "paused", error)
+                self.repo.set_job_status(job_id, "failed", error)
             return
         if self.repo.is_stop_requested(job_id):
             current = self.repo.get_job(job_id)
@@ -56,6 +56,11 @@ class PipelineRunner:
         self.repo.set_job_status(job_id, "completed")
         if job["type"] == "preprocess":
             self.repo.set_project_status(project["id"], "ready_for_tts")
+            try:
+                self.repo.create_job(project["id"], "character_analysis")
+            except RuntimeError as exc:
+                if not str(exc).startswith("job_exists:"):
+                    raise
 
     def _preprocess(self, job: dict[str, Any], project: dict[str, Any]) -> None:
         for chapter_data in self.repo.list_included_chapters(project["id"]):
@@ -113,12 +118,6 @@ class PipelineRunner:
             self.repo.update_chapter_status(chapter_id, "reviewed")
             self._event(job, "chapter.reviewed", {"chapter_id": chapter_id, "position": chapter.position})
 
-        try:
-            self._analyze_characters(job, project)
-        except Exception as exc:
-            self._log(job, "character_analysis", str(exc))
-            self._event(job, "characters.failed", {"error": str(exc)})
-
     def _analyze_characters(self, job: dict[str, Any], project: dict[str, Any]) -> None:
         self.repo.refresh_characters(project["id"])
         characters = self.executor.analyze_characters(project)
@@ -126,10 +125,22 @@ class PipelineRunner:
 
     def _render(self, job: dict[str, Any], project: dict[str, Any]) -> None:
         chapters = self.repo.list_selected_chapters(project["id"], job["payload"])
+        completed = self.repo.completed_stage_chapter_ids(job["id"], "render")
+        valid_audio = {
+            artifact["chapter_id"]
+            for artifact in self.repo.list_artifacts(project["id"])
+            if artifact["kind"] == "chapter_mp3"
+            and (path := self.repo.storage_root / artifact["path"]).is_file()
+            and path.stat().st_size
+        }
         for chapter_data in chapters:
             if self.repo.is_stop_requested(job["id"]):
                 raise StageCancelled("Stage cancelled")
             chapter_id = chapter_data["id"]
+            if chapter_id in completed and chapter_id in valid_audio:
+                self.repo.update_chapter_status(chapter_id, "done")
+                self._log(job, "tts", f"第 {chapter_data['included_position']} 章已有有效音频，已跳过")
+                continue
             chapter = self.repo.get_chapter_record(chapter_id)
             self.repo.update_stage(job["id"], chapter_id, "render", "running")
             self.repo.update_chapter_status(chapter_id, "rendering")

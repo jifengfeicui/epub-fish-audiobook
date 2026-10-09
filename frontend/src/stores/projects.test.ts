@@ -13,4 +13,14 @@ describe('projects store events', () => {
     expect(store.events).toHaveLength(1)
     expect(store.latestEventId).toBe(7)
   })
+
+  it('keeps only the latest 50 websocket events', () => {
+    const store = useProjectsStore()
+    for (let eventId = 1; eventId <= 60; eventId += 1) {
+      store.receiveEvent({ event_id: eventId, job_id: 'job', type: 'log', timestamp: '2026-01-01T00:00:00Z', payload: {} })
+    }
+    expect(store.events).toHaveLength(50)
+    expect(store.events[0].event_id).toBe(11)
+    expect(store.latestEventId).toBe(60)
+  })
 })

@@ -1,13 +1,13 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ArrowLeft, Ban, BookOpenText, Check, Download, FileAudio, Pause, Play, RefreshCw, RotateCcw, Save, ScrollText, Settings2, Tv, Users, Wifi, WifiOff, XCircle } from 'lucide-vue-next'
 import { useRoute, useRouter } from 'vue-router'
-import { api } from '../api/client'
+import { api, notifyError } from '../api/client'
 import { connectProjectEvents } from '../api/events'
 import { useProjectsStore } from '../stores/projects'
 import StatusBadge from '../components/StatusBadge.vue'
 import BilibiliPanel from '../components/BilibiliPanel.vue'
-import type { JobEvent, Script } from '../types'
+import type { BilibiliStatus, JobEvent, Script } from '../types'
 
 interface VoiceProfile { id: string; name: string; gender: string; traits: string; enabled: boolean; sample_available: boolean; sample_url: string | null }
 
@@ -29,6 +29,7 @@ const ttsTo = ref<number | ''>(1)
 const includedChapterIds = ref<number[]>([])
 const chapterSelectionDirty = ref(false)
 const savingChapters = ref(false)
+const bilibiliStatus = ref<BilibiliStatus | null>(null)
 let disconnect: (() => void) | undefined
 let refreshTimer = 0
 let previewAudio: HTMLAudioElement | null = null
@@ -46,12 +47,32 @@ const selectedChapters = computed(() => {
   return includedChapters.value.slice(start - 1, end)
 })
 const progress = computed(() => {
+  if (job.value?.type === 'bilibili') {
+    if (job.value.status === 'completed') return 100
+    if (job.value.payload?.action === 'prepare') {
+      return Math.round(((bilibiliStatus.value?.prepared_count || 0) / (bilibiliStatus.value?.continuous_audio_count || 1)) * 100)
+    }
+    const total = Number(job.value.payload?.parts || 1)
+    return Math.min(99, Math.round((Number(job.value.payload?.uploaded_parts || 0) / total) * 100))
+  }
+  if (job.value?.type === 'merge') return job.value.status === 'completed' ? 100 : 0
+  if (job.value?.type === 'character_analysis') {
+    const complete = store.characters.filter(character => character.gender && character.personality).length
+    return Math.round((complete / (store.characters.length || 1)) * 100)
+  }
   const total = selectedChapters.value.length || 1
   const preprocess = job.value?.type !== 'render'
   const complete = selectedChapters.value.filter(chapter => preprocess
     ? ['reviewed', 'rendering', 'done'].includes(chapter.status)
     : chapter.status === 'done').length
   return Math.round((complete / total) * 100)
+})
+const uploadProgress = computed(() => {
+  if (job.value?.type !== 'bilibili' || job.value.payload?.action === 'prepare') return ''
+  const total = Number(job.value.payload?.parts || 1)
+  if (job.value.status === 'completed') return `本次 ${total}/${total} 个分P已获远端确认`
+  const uploaded = Math.min(total, Number(job.value.payload?.uploaded_parts || 0))
+  return `本次已上传 ${uploaded}/${total} 个分P${uploaded === total ? '，等待远端确认' : ''}`
 })
 const canRender = computed(() => !chapterSelectionDirty.value && Boolean(narratorVoiceId.value) && includedChapters.value.length > 0 && includedChapters.value.every(chapter => ['reviewed', 'done'].includes(chapter.status)))
 const canMerge = computed(() => !chapterSelectionDirty.value && includedChapters.value.length > 0 && includedChapters.value.every(chapter =>
@@ -61,6 +82,8 @@ const jobLabel = computed(() => job.value?.type === 'render' ? 'TTS' : job.value
 const pendingCharacterCount = computed(() => store.characters.filter(character => !character.gender || !character.personality).length)
 const ttsRangeValid = computed(() => Number(ttsFrom.value) >= 1 && Number(ttsTo.value) >= Number(ttsFrom.value) && Number(ttsTo.value) <= includedChapters.value.length)
 const allowedVoiceIds = computed(() => new Set(voices.value.filter(voice => voice.enabled && !excludedVoiceIds.value.includes(voice.id)).map(voice => voice.id)))
+
+watch(() => job.value?.error, error => { if (error) notifyError(error) })
 
 function characterVoices(currentId: string | null) {
   return voices.value.filter(voice => (voice.id !== narratorVoiceId.value && allowedVoiceIds.value.has(voice.id)) || voice.id === currentId)
@@ -77,10 +100,12 @@ function playVoice(id: string | null) {
 }
 
 async function refresh() {
-  const [, voiceRows] = await Promise.all([
+  const [, voiceRows, bilibili] = await Promise.all([
     store.loadProject(projectId.value),
     api.get<VoiceProfile[]>('/api/v1/voices'),
+    api.get<BilibiliStatus>(`/api/v1/projects/${projectId.value}/bilibili?sync_remote=false`),
   ])
+  bilibiliStatus.value = bilibili
   voices.value = voiceRows.map(voice => {
     voice.enabled ??= true
     voice.sample_available ??= false
@@ -200,9 +225,10 @@ onBeforeUnmount(() => { window.clearTimeout(refreshTimer); previewAudio?.pause()
 <template>
   <section v-if="store.current" class="page project-page">
     <button class="back-link" @click="router.push('/')"><ArrowLeft :size="17" />返回项目</button>
-    <div class="project-heading"><div><span class="eyebrow">{{ store.current.source_filename }}</span><h1>{{ store.current.title }}</h1><div class="connection"><component :is="connected ? Wifi : WifiOff" :size="14" />{{ connected ? '实时进度已连接' : '正在重连进度' }}</div></div><div class="heading-actions"><button v-if="job?.status === 'paused' && job.error" class="button secondary" @click="control('retry')"><RefreshCw :size="17" />重试{{ jobLabel }}</button><button v-else-if="job?.status === 'paused' || job?.status === 'interrupted'" class="button secondary" @click="control('resume')"><Play :size="17" />继续{{ jobLabel }}</button><button v-else-if="running" class="button secondary" @click="control('pause')"><Pause :size="17" />暂停</button><template v-else><button class="button secondary" :disabled="chapterSelectionDirty" @click="reparse"><RotateCcw :size="17" />重新识别章节</button><button class="button secondary" :disabled="chapterSelectionDirty" @click="startJob('preprocess')"><RefreshCw :size="17" />{{ store.current.status === 'ready' ? '开始预解析' : '重新预解析' }}</button><button class="button primary" :disabled="!canRender" :title="narratorVoiceId ? '全部启用章节预解析成功后可选择本次 TTS 范围' : '请先在项目设置中选择旁白音色'" @click="openTtsRange"><Play :size="17" />开始 TTS</button><button class="button secondary" :disabled="!canMerge" title="全部启用章节都有有效音频后可用" @click="startJob('merge')"><FileAudio :size="17" />合成整书</button></template><button v-if="job && !['completed', 'cancelled'].includes(job.status)" class="button danger" @click="control('cancel')"><XCircle :size="17" />取消</button></div></div>
-    <div class="progress-panel"><div class="progress-copy"><div><strong>{{ progress }}%</strong><span>{{ jobLabel }}进度</span></div><StatusBadge :status="running || job?.status === 'paused' ? (job?.status || store.current.status) : store.current.status" /></div><div class="progress-track"><span :style="{ width: `${progress}%` }" /></div><div class="pipeline-legend"><span><i class="dot review" />预解析：{{ includedChapters.filter(c => ['reviewed', 'rendering', 'done'].includes(c.status)).length }}/{{ includedChapters.length }}</span><span><i class="dot audio" />音频：{{ includedChapters.filter(c => c.status === 'done').length }}/{{ includedChapters.length }}</span><span>{{ canRender ? '启用章节预解析已完成' : 'TTS 等待预解析完成' }}</span></div></div>
-    <p v-if="job?.error" class="form-error">{{ job.error }}</p><p v-if="message" class="inline-message">{{ message }}</p>
+    <div class="project-heading"><div><span class="eyebrow">{{ store.current.source_filename }}</span><h1>{{ store.current.title }}</h1><div class="connection"><component :is="connected ? Wifi : WifiOff" :size="14" />{{ connected ? '实时进度已连接' : '正在重连进度' }}</div></div><div class="heading-actions"><button v-if="job?.status === 'failed'" class="button secondary" @click="control('retry')"><RefreshCw :size="17" />重试{{ jobLabel }}</button><button v-else-if="job?.status === 'paused' || job?.status === 'interrupted'" class="button secondary" @click="control('resume')"><Play :size="17" />继续{{ jobLabel }}</button><button v-else-if="running" class="button secondary" @click="control('pause')"><Pause :size="17" />暂停</button><template v-else><button class="button secondary" :disabled="chapterSelectionDirty" @click="reparse"><RotateCcw :size="17" />重新识别章节</button><button class="button secondary" :disabled="chapterSelectionDirty" @click="startJob('preprocess')"><RefreshCw :size="17" />{{ store.current.status === 'ready' ? '开始预解析' : '重新预解析' }}</button><button class="button primary" :disabled="!canRender" :title="narratorVoiceId ? '全部启用章节预解析成功后可选择本次 TTS 范围' : '请先在项目设置中选择旁白音色'" @click="openTtsRange"><Play :size="17" />开始 TTS</button><button class="button secondary" :disabled="!canMerge" title="全部启用章节都有有效音频后可用" @click="startJob('merge')"><FileAudio :size="17" />合成整书</button></template><button v-if="job && !['completed', 'cancelled'].includes(job.status)" class="button danger" @click="control('cancel')"><XCircle :size="17" />取消</button></div></div>
+    <div class="progress-panel"><div class="progress-copy"><div><strong>{{ progress }}%</strong><span>{{ jobLabel }}进度</span></div><StatusBadge :status="running || job?.status === 'paused' ? (job?.status || store.current.status) : store.current.status" /></div><div class="progress-track"><span :style="{ width: `${progress}%` }" /></div><div class="pipeline-legend"><span><i class="dot review" />预解析：{{ includedChapters.filter(c => ['reviewed', 'rendering', 'done'].includes(c.status)).length }}/{{ includedChapters.length }}</span><span><i class="dot audio" />音频：{{ includedChapters.filter(c => c.status === 'done').length }}/{{ includedChapters.length }}</span><span><i class="dot video" />准备视频：{{ bilibiliStatus?.prepared_count || 0 }}/{{ includedChapters.length }}</span><span><i class="dot publish" />发布：{{ bilibiliStatus?.published_count || 0 }}/{{ includedChapters.length }}</span><span>{{ canRender ? '启用章节预解析已完成' : 'TTS 等待预解析完成' }}</span></div></div>
+    <p v-if="uploadProgress" class="inline-message">{{ uploadProgress }}</p>
+    <p v-if="message" class="inline-message">{{ message }}</p>
     <div class="section-layout project-section-layout">
       <nav class="section-nav" aria-label="项目内容">
         <button :class="{ active: activeTab === 'chapters' }" @click="activeTab = 'chapters'"><BookOpenText :size="17" /><span>章节</span><small>{{ includedChapterIds.length }}</small></button>

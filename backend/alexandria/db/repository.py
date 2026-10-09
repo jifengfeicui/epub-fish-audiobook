@@ -35,6 +35,7 @@ from .models import (
 
 
 ACTIVE_JOB_STATES = ("queued", "running", "pausing")
+OPEN_JOB_STATES = (*ACTIVE_JOB_STATES, "paused", "interrupted", "failed")
 EDITABLE_JOB_STATES = ("paused", "completed")
 SECRET_KEYS = {"llm_api_key", "fish_api_key"}
 
@@ -256,6 +257,13 @@ class Repository:
                 result.append(self.chapter_dict(row, included_position if row.included else None))
             return result
 
+    def list_chapter_sources(self, project_id: str) -> list[dict[str, str]]:
+        with self.db.session() as session:
+            rows = session.scalars(
+                select(Chapter).where(Chapter.project_id == project_id).order_by(Chapter.position)
+            ).all()
+            return [{"title": row.title, "source_text": row.source_text} for row in rows]
+
     def list_included_chapters(self, project_id: str) -> list[dict[str, Any]]:
         return [row for row in self.list_chapters(project_id) if row["included"]]
 
@@ -426,14 +434,14 @@ class Repository:
             project = session.get(Project, project_id)
             if project is None:
                 raise KeyError(project_id)
-            active = session.scalar(select(Job).where(Job.status.in_(ACTIVE_JOB_STATES)).limit(1))
-            if active:
-                raise RuntimeError("active_job")
-            resumable = session.scalar(
-                select(Job).where(Job.project_id == project_id, Job.status.in_(("paused", "interrupted"))).limit(1)
-            )
-            if resumable:
-                raise RuntimeError("resumable_job")
+            key = self.job_key(job_type, payload)
+            for existing in session.scalars(select(Job).where(
+                Job.project_id == project_id,
+                Job.status.in_(OPEN_JOB_STATES),
+                Job.job_type == job_type,
+            )).all():
+                if self.job_key(existing.job_type, json.loads(existing.payload_json or "{}")) == key:
+                    raise RuntimeError(f"job_exists:{existing.id}")
             if job_type == "render":
                 chapters = self.list_selected_chapters(project_id, payload)
                 ready = 0
@@ -487,6 +495,14 @@ class Repository:
                 raise KeyError(job_id)
             return self.job_dict(job)
 
+    def update_job_payload(self, job_id: str, values: dict[str, Any]) -> None:
+        with self.db.session() as session, session.begin():
+            job = session.get(Job, job_id)
+            if job is None:
+                raise KeyError(job_id)
+            payload = json.loads(job.payload_json or "{}")
+            job.payload_json = json.dumps({**payload, **values}, ensure_ascii=False)
+
     @staticmethod
     def job_dict(job: Job) -> dict[str, Any]:
         return {
@@ -505,6 +521,27 @@ class Repository:
             "finished_at": _iso(job.finished_at),
         }
 
+    @staticmethod
+    def job_key(job_type: str, payload: dict[str, Any]) -> str:
+        return f"bilibili:{payload.get('action')}" if job_type == "bilibili" else job_type
+
+    def list_jobs(self, project_id: str, limit: int = 20) -> dict[str, Any]:
+        with self.db.session() as session:
+            if session.get(Project, project_id) is None:
+                raise KeyError(project_id)
+            rows = session.scalars(
+                select(Job).where(Job.project_id == project_id).order_by(Job.created_at.desc()).limit(limit)
+            ).all()
+            current = session.scalar(
+                select(Job).where(Job.status.in_(("running", "pausing"))).order_by(Job.started_at.desc()).limit(1)
+            )
+            jobs = [self.job_dict(row) for row in rows]
+            return {
+                "current_job": self.job_dict(current) if current else None,
+                "resumable_jobs": [row for row in jobs if row["status"] in ("paused", "interrupted", "failed")],
+                "jobs": jobs,
+            }
+
     def next_queued_job(self) -> str | None:
         with self.db.session() as session:
             return session.scalar(select(Job.id).where(Job.status == "queued").order_by(Job.created_at).limit(1))
@@ -516,6 +553,8 @@ class Repository:
             if job is None:
                 raise KeyError(job_id)
             if job.status == "cancelled" and status != "cancelled":
+                return self.job_dict(job)
+            if status == "running" and job.status != "queued":
                 return self.job_dict(job)
             job.status = status
             job.error = error
@@ -546,17 +585,18 @@ class Repository:
 
     def resume_job(self, job_id: str) -> dict[str, Any]:
         with self._job_lock:
-            return self._resume_job(job_id)
+            return self._resume_job(job_id, ("paused", "interrupted"))
 
-    def _resume_job(self, job_id: str) -> dict[str, Any]:
+    def retry_job(self, job_id: str) -> dict[str, Any]:
+        with self._job_lock:
+            return self._resume_job(job_id, ("failed",))
+
+    def _resume_job(self, job_id: str, allowed: tuple[str, ...]) -> dict[str, Any]:
         with self.db.session() as session, session.begin():
-            active = session.scalar(select(Job).where(Job.status.in_(ACTIVE_JOB_STATES), Job.id != job_id).limit(1))
-            if active:
-                raise RuntimeError("active_job")
             job = session.get(Job, job_id)
             if job is None:
                 raise KeyError(job_id)
-            if job.status not in ("paused", "interrupted"):
+            if job.status not in allowed:
                 raise RuntimeError("not_resumable")
             job.status = "queued"
             job.cancel_requested = False
@@ -605,14 +645,13 @@ class Repository:
                 self.event_publisher(project_id, result)
         return result
 
-    def list_events(self, project_id: str, after: int = 0, limit: int = 500) -> list[dict[str, Any]]:
+    def list_events(self, project_id: str, after: int | None = None, limit: int = 500) -> list[dict[str, Any]]:
         with self.db.session() as session:
-            events = session.scalars(
-                select(JobEvent)
-                .where(JobEvent.project_id == project_id, JobEvent.id > after)
-                .order_by(JobEvent.id)
-                .limit(limit)
-            ).all()
+            query = select(JobEvent).where(JobEvent.project_id == project_id)
+            if after is None:
+                events = list(reversed(session.scalars(query.order_by(JobEvent.id.desc()).limit(50)).all()))
+            else:
+                events = session.scalars(query.where(JobEvent.id > after).order_by(JobEvent.id).limit(limit)).all()
             return [
                 {
                     "event_id": row.id,
@@ -1103,6 +1142,14 @@ class Repository:
                 row.started_at = utcnow()
             if status in ("completed", "failed", "interrupted"):
                 row.finished_at = utcnow()
+
+    def completed_stage_chapter_ids(self, job_id: str, stage: str) -> set[int]:
+        with self.db.session() as session:
+            return set(session.scalars(select(StageRun.chapter_id).where(
+                StageRun.job_id == job_id,
+                StageRun.stage == stage,
+                StageRun.status == "completed",
+            )).all())
 
     def save_audio_segment(self, *, project_id: str, chapter_id: int, revision_id: str, position: int, fingerprint: str, path: str, status: str, attempts: int, error: str | None = None) -> None:
         with self.db.session() as session, session.begin():

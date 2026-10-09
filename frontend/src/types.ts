@@ -98,6 +98,7 @@ export type BilibiliChapterState = 'missing' | 'ready' | 'published' | 'outdated
 export interface BilibiliChapter {
   id: number
   position: number
+  included_position: number
   title: string
   bilibili_state: BilibiliChapterState
   image_url: string | null
@@ -126,6 +127,7 @@ export interface BilibiliStatus {
     bvid: string
     aid?: string | null
     last_sync_at?: string
+    remote_count?: number
     sync_error?: string
     remote_mismatch?: boolean
   }

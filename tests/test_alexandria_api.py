@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from io import BytesIO
+from unittest.mock import patch
 
 try:
     from fastapi.testclient import TestClient
@@ -109,6 +110,21 @@ class ApiTests(unittest.TestCase):
             422,
         )
 
+    def test_failed_job_uses_retry_endpoint(self):
+        created = self.client.post(
+            "/api/v1/projects",
+            files={"file": ("book.txt", BytesIO("第1章\n正文".encode("utf-8")), "text/plain")},
+        )
+        project_id = created.json()["id"]
+        job = self.client.post(f"/api/v1/projects/{project_id}/jobs", json={"type": "preprocess"}).json()
+        self.client.app.state.repository.set_job_status(job["id"], "failed", "boom")
+
+        self.assertEqual(self.client.post(f"/api/v1/jobs/{job['id']}/resume").status_code, 409)
+        retried = self.client.post(f"/api/v1/jobs/{job['id']}/retry")
+        self.assertEqual(retried.status_code, 200)
+        self.assertEqual(retried.json()["status"], "queued")
+        self.assertIsNone(retried.json()["error"])
+
     def test_bilibili_account_and_job_payload(self):
         created = self.client.post(
             "/api/v1/projects",
@@ -124,6 +140,20 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(invalid.status_code, 422)
         invalid_line = self.client.post(f"/api/v1/projects/{project_id}/bilibili/jobs", json={"action": "append", "parts": 1, "line": "unknown"})
         self.assertEqual(invalid_line.status_code, 422)
+
+    def test_bilibili_metadata_endpoint(self):
+        created = self.client.post(
+            "/api/v1/projects",
+            files={"file": ("book.txt", BytesIO("作者和出版社\n正文".encode("utf-8")), "text/plain")},
+        )
+        project_id = created.json()["id"]
+        with patch.object(self.client.app.state.bilibili, "extract_metadata", return_value={
+            "author": "作者", "publisher": "出版社", "description": "简介",
+        }) as extract:
+            response = self.client.post(f"/api/v1/projects/{project_id}/bilibili/metadata")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["author"], "作者")
+        extract.assert_called_once_with(project_id)
 
     def test_artifact_play_still_returns_audio(self):
         created = self.client.post(

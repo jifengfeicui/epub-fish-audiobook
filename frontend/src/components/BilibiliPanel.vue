@@ -1,31 +1,34 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { ExternalLink, Film, LoaderCircle, Play, RefreshCw, Replace, Upload } from 'lucide-vue-next'
+import { ExternalLink, Film, LoaderCircle, Play, RefreshCw, Replace, Sparkles, Upload } from 'lucide-vue-next'
 import { api } from '../api/client'
 import type { BilibiliStatus } from '../types'
 
 const props = defineProps<{ projectId: string; running: boolean }>()
 const emit = defineEmits<{ refresh: [] }>()
 const state = ref<BilibiliStatus | null>(null)
-const error = ref('')
 const busy = ref(false)
+const extractingMetadata = ref(false)
 const publishParts = ref(1)
 const appendParts = ref(1)
 const previewChapter = ref<number | null>(null)
+const metadataAttempted = ref(false)
 const stateLabels = { missing: '未生成', ready: '可发布', published: '已发布', outdated: '音频已变化', remote_mismatch: '远端不一致' }
 const availablePublish = computed(() => state.value?.appendable_count || 0)
 
 async function load() {
-  error.value = ''
   try {
     state.value = await api.get<BilibiliStatus>(`/api/v1/projects/${props.projectId}/bilibili`)
     publishParts.value = Math.max(1, Math.min(publishParts.value, availablePublish.value || 1))
     appendParts.value = Math.max(1, Math.min(appendParts.value, availablePublish.value || 1))
-  } catch (reason) { error.value = (reason as Error).message }
+    if (!metadataAttempted.value && !state.value.publication && !state.value.form.author.trim()) {
+      metadataAttempted.value = true
+      await extractMetadata()
+    }
+  } catch { /* global toast */ }
 }
 
 async function start(payload: Record<string, unknown>) {
-  error.value = ''
   if (payload.action === 'publish' && state.value?.form.visibility === 'public') {
     if (!window.confirm('公开投稿将立即对外可见，并可能触发审核。确认继续吗？')) return
     payload.confirm_public = true
@@ -35,8 +38,21 @@ async function start(payload: Record<string, unknown>) {
     await api.post(`/api/v1/projects/${props.projectId}/bilibili/jobs`, payload)
     emit('refresh')
     await load()
-  } catch (reason) { error.value = (reason as Error).message }
+  } catch { /* global toast */ }
   finally { busy.value = false }
+}
+
+async function extractMetadata() {
+  if (!state.value) return
+  extractingMetadata.value = true
+  try {
+    const result = await api.post<{ author: string; publisher: string; description: string }>(`/api/v1/projects/${props.projectId}/bilibili/metadata`)
+    if (!state.value.form.author.trim()) state.value.form.author = result.author
+    if (!state.value.form.publisher.trim()) state.value.form.publisher = result.publisher
+    const defaultDesc = `《${state.value.form.title.replace(/^《|》AI有声书$/g, '')}》AI有声书。\n按章节分P，音频由TTS生成。`
+    if (!state.value.form.desc.trim() || state.value.form.desc === defaultDesc) state.value.form.desc = result.description
+  } catch { /* global toast */ }
+  finally { extractingMetadata.value = false }
 }
 
 function publish() {
@@ -57,7 +73,6 @@ onMounted(load)
       <div><h2>B站分章投稿</h2><span class="muted">一个项目对应一个稿件，章节按顺序成为分P</span></div>
       <button class="icon-button" title="检查本地与远端状态" :disabled="busy" @click="load"><RefreshCw :size="17" /></button>
     </div>
-    <p v-if="error" class="form-error">{{ error }}</p>
     <template v-if="state">
       <div class="bilibili-metrics">
         <div><strong>{{ state.continuous_audio_count }}</strong><span>连续音频</span></div>
@@ -68,10 +83,12 @@ onMounted(load)
       <div class="bilibili-toolbar">
         <button class="button secondary" :disabled="running || busy || !state.continuous_audio_count" @click="start({ action: 'prepare' })"><Film :size="16" />准备视频</button>
         <a v-if="state.publication?.bvid" class="button secondary" :href="`https://www.bilibili.com/video/${state.publication.bvid}`" target="_blank" rel="noreferrer"><ExternalLink :size="16" />{{ state.publication.bvid }}</a>
+        <span v-if="state.publication?.remote_count != null" class="muted">远端已确认 {{ state.publication.remote_count }} 个分P</span>
         <span v-if="state.publication?.sync_error" class="warning-text">远端同步失败，保留本地状态</span>
       </div>
 
       <div v-if="!state.publication" class="bilibili-form">
+        <div class="metadata-toolbar"><span class="muted">作者、出版社和简介可从书籍原文提取</span><button class="button secondary" :disabled="running || busy || extractingMetadata" @click="extractMetadata"><Sparkles :size="15" />{{ extractingMetadata ? '提取中…' : '从书籍提取' }}</button></div>
         <label>稿件标题<input v-model.trim="state.form.title" maxlength="80" /></label>
         <div class="inline-fields"><label>作者<input v-model.trim="state.form.author" /></label><label>出版社<input v-model.trim="state.form.publisher" /></label></div>
         <label>转载来源<input v-model.trim="state.form.source" required /></label>
@@ -88,7 +105,7 @@ onMounted(load)
 
       <div class="bilibili-chapters">
         <div v-for="chapter in state.chapters" :key="chapter.id" class="bilibili-chapter-row">
-          <span class="chapter-number">{{ String(chapter.position).padStart(3, '0') }}</span>
+          <span class="chapter-number">{{ String(chapter.included_position).padStart(3, '0') }}</span>
           <strong>{{ chapter.title }}</strong>
           <span :class="['bilibili-state', chapter.bilibili_state]">{{ stateLabels[chapter.bilibili_state] }}</span>
           <button v-if="chapter.video_url" class="icon-button" title="预览章节视频" @click="previewChapter = previewChapter === chapter.id ? null : chapter.id"><Play :size="15" /></button>

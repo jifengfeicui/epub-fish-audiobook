@@ -40,7 +40,7 @@ export const useProjectsStore = defineStore('projects', () => {
     const mergedEvents = [...previousEvents, ...eventRows]
     events.value = Array.from(new Map(mergedEvents.map(event => [event.event_id, event])).values())
       .sort((left, right) => left.event_id - right.event_id)
-      .slice(-500)
+      .slice(-50)
     speakerAssignments.value = assignmentRows
     characters.value = characterRows
   }
@@ -49,7 +49,7 @@ export const useProjectsStore = defineStore('projects', () => {
     if (events.value.some(item => item.event_id === event.event_id)) return
     events.value.push(event)
     events.value.sort((left, right) => left.event_id - right.event_id)
-    if (events.value.length > 500) events.value.shift()
+    if (events.value.length > 50) events.value.shift()
   }
 
   return { projects, current, chapters, artifacts, speakerAssignments, characters, events, loading, error, latestEventId, loadProjects, loadProject, receiveEvent }

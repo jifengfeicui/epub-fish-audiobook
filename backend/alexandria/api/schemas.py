@@ -96,6 +96,18 @@ BilibiliJobCreate = Annotated[
 ]
 
 
+class BilibiliReconcile(BaseModel):
+    bvid: Optional[str] = Field(default=None, pattern=r"^BV[0-9A-Za-z]{10}$")
+    confirm_not_created: bool = False
+
+    @field_validator("confirm_not_created")
+    @classmethod
+    def require_choice(cls, value: bool, info):
+        if not value and not info.data.get("bvid"):
+            raise ValueError("Provide a BV number or confirm that no publication was created")
+        return value
+
+
 class SettingsUpdate(BaseModel):
     llm_base_url: Optional[str] = None
     llm_api_key: Optional[str] = None

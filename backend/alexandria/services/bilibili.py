@@ -30,6 +30,15 @@ PICSUM_URL = "https://picsum.photos/1920/1080"
 DEFAULT_TAGS = "有声书,读书,知识分享,AI配音"
 TV_APP_KEY = "4409e2ce8ffd12b8"
 TV_APP_SECRET = "59b43e04ad6965f34319062b478f83dd"
+BILI_LOGIN_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+    "Referer": "https://www.bilibili.com/",
+}
+BILI_MEMBER_HEADERS = {
+    **BILI_LOGIN_HEADERS,
+    "Origin": "https://member.bilibili.com",
+    "Referer": "https://member.bilibili.com/",
+}
 QR_CREATE_URL = "https://passport.bilibili.com/x/passport-tv-login/qrcode/auth_code"
 QR_POLL_URL = "https://passport.bilibili.com/x/passport-tv-login/qrcode/poll"
 ACCOUNT_URL = "https://api.bilibili.com/x/web-interface/nav"
@@ -109,6 +118,73 @@ class BilibiliService:
             "line": "cnbldsa",
         }
 
+    def extract_metadata(self, project_id: str) -> dict[str, str]:
+        from openai import OpenAI
+
+        project = self.repo.get_project(project_id)
+        source_parts: list[str] = []
+        remaining = 12000
+        for chapter in self.repo.list_chapter_sources(project_id):
+            if remaining <= 0:
+                break
+            part = f"\n\n## {chapter['title']}\n{chapter['source_text']}"
+            source_parts.append(part[:remaining])
+            remaining -= len(part)
+        if not source_parts:
+            raise RuntimeError("bilibili_metadata_failed:book has no source text")
+        settings = self.repo.get_settings(reveal_secrets=True)
+        client = OpenAI(
+            base_url=settings.get("llm_base_url", "http://localhost:1234/v1"),
+            api_key=settings.get("llm_api_key", "local"),
+            timeout=90,
+        )
+        try:
+            response = client.chat.completions.create(
+                model=settings.get("llm_model", "local-model"),
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "你是图书编目助手。只根据书籍原文提取信息，不确定就返回空字符串。只输出JSON对象。",
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            "请从下面的书籍内容中提取作者、出版社，并写一段适合B站有声书投稿的简短中文简介。"
+                            "字段必须是 author、publisher、description，值都必须是字符串；不要猜测，不要添加其他字段。\n"
+                            f"书名：{project['title']}\n书籍内容：{''.join(source_parts)}"
+                        ),
+                    },
+                ],
+                temperature=0.1,
+                max_tokens=600,
+                reasoning_effort="none",
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "book_metadata",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": {key: {"type": "string"} for key in ("author", "publisher", "description")},
+                            "required": ["author", "publisher", "description"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+            )
+            text = (response.choices[0].message.content or "").strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            value = json.loads(text)
+            if not isinstance(value, dict):
+                raise ValueError("LLM returned invalid metadata")
+        except Exception as exc:
+            raise RuntimeError("bilibili_metadata_failed") from exc
+        return {
+            key: str(value.get(key) or "").strip()[:2000]
+            for key in ("author", "publisher", "description")
+        }
+
     def _continuous_audio(self, project_id: str) -> list[dict[str, Any]]:
         chapters = self.repo.list_included_chapters(project_id)
         artifacts: dict[int, dict[str, Any]] = {}
@@ -126,7 +202,7 @@ class BilibiliService:
                 path.relative_to(root)
             except ValueError as exc:
                 raise ValueError(f"artifact_path_escape:{artifact['id']}") from exc
-            result.append({**chapter, "position": chapter["included_position"], "artifact": artifact, "audio": path})
+            result.append({**chapter, "artifact": artifact, "audio": path})
         return result
 
     @staticmethod
@@ -330,7 +406,7 @@ class BilibiliService:
             if should_stop():
                 raise StageCancelled("B站任务已暂停")
             old = old_by_id.get(chapter["id"], {})
-            stem = _safe_name(f"{chapter['position']:04d}-{chapter['title']}")
+            stem = _safe_name(f"{chapter['included_position']:04d}-{chapter['title']}")
             image = root / "images" / f"{chapter['id']}.jpg"
             video = root / "videos" / f"{stem}.mp4"
             image_url = old.get("image_url", "")
@@ -350,7 +426,7 @@ class BilibiliService:
                 self._render_video(image, chapter["audio"], video, stem, ffmpeg, log, should_stop)
                 video_duration = self._validate_video(video, chapter["duration"], ffprobe)
             record = {
-                "chapter_id": chapter["id"], "position": chapter["position"], "title": chapter["title"],
+                "chapter_id": chapter["id"], "included_position": chapter["included_position"], "title": chapter["title"],
                 "artifact_id": chapter["artifact"]["id"], "audio_path": chapter["artifact"]["path"],
                 "source_sha256": chapter["source_sha256"], "source_duration": round(chapter["duration"], 6),
                 "image": image.relative_to(root).as_posix(), "image_url": image_url,
@@ -380,7 +456,7 @@ class BilibiliService:
         if not self.cookie_path.is_file():
             return {"logged_in": False, "name": None}
         try:
-            response = httpx.get(ACCOUNT_URL, cookies=self._cookies(self._cookie_data()), timeout=15)
+            response = httpx.get(ACCOUNT_URL, cookies=self._cookies(self._cookie_data()), headers=BILI_LOGIN_HEADERS, timeout=15)
             response.raise_for_status()
             data = response.json()
             account = data.get("data") or {}
@@ -392,8 +468,18 @@ class BilibiliService:
 
     def start_login(self) -> dict[str, Any]:
         timestamp = int(time.time())
-        response = httpx.post(QR_CREATE_URL, data=_signed({"appkey": TV_APP_KEY, "local_id": 0, "ts": timestamp}), timeout=20)
-        response.raise_for_status()
+        try:
+            response = httpx.post(
+                QR_CREATE_URL,
+                data=_signed({"appkey": TV_APP_KEY, "local_id": 0, "ts": timestamp}),
+                headers=BILI_LOGIN_HEADERS,
+                timeout=20,
+            )
+            if response.status_code == 412:
+                raise RuntimeError("bilibili_login_blocked")
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise RuntimeError("bilibili_login_start_failed") from exc
         payload = response.json()
         if payload.get("code") != 0:
             raise RuntimeError(f"bilibili_login_start_failed:{payload.get('message') or payload.get('code')}")
@@ -411,8 +497,13 @@ class BilibiliService:
             self.login_sessions.pop(session_id, None)
             return {"status": "expired", "name": None}
         values = _signed({"appkey": TV_APP_KEY, "auth_code": session["auth_code"], "local_id": 0, "ts": int(time.time())})
-        response = httpx.post(QR_POLL_URL, data=values, timeout=20)
-        response.raise_for_status()
+        try:
+            response = httpx.post(QR_POLL_URL, data=values, headers=BILI_LOGIN_HEADERS, timeout=20)
+            if response.status_code == 412:
+                raise RuntimeError("bilibili_login_blocked")
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise RuntimeError("bilibili_login_poll_failed") from exc
         payload = response.json()
         code = payload.get("code")
         if code == 86039:
@@ -458,7 +549,10 @@ class BilibiliService:
         manifest = self.load_manifest(project_id)
         if manifest.get("status") != "ready":
             raise RuntimeError("bilibili_not_prepared")
-        return manifest, manifest.get("chapters") or []
+        records = manifest.get("chapters") or []
+        for included_position, record in enumerate(records, 1):
+            record.setdefault("included_position", included_position)
+        return manifest, records
 
     def _validate_records(self, project_id: str, records: list[dict[str, Any]]) -> None:
         ffprobe = shutil.which("ffprobe")
@@ -482,7 +576,9 @@ class BilibiliService:
         access_token = login.get("token_info", {}).get("access_token")
         if not access_token:
             raise RuntimeError("bilibili_access_token_missing")
-        response = httpx.get(STUDIO_URL, params={"access_key": access_token, "bvid": bvid}, timeout=30)
+        response = httpx.get(STUDIO_URL, params={"access_key": access_token, "bvid": bvid}, headers=BILI_MEMBER_HEADERS, timeout=30)
+        if response.status_code == 412:
+            raise RuntimeError("bilibili_studio_blocked")
         response.raise_for_status()
         payload = response.json()
         if payload.get("code") != 0 or not isinstance(payload.get("data"), dict):
@@ -513,6 +609,28 @@ class BilibiliService:
         publication["remote_count"] = len(remote)
         publication.pop("sync_error", None)
         chapters = manifest.get("chapters") or []
+
+        # Recover local publication markers when a previous upload completed
+        # remotely before the manifest was written (for example after a
+        # browser refresh or process restart).  Biliup keeps the uploaded
+        # filename, so only mark an item published when that filename matches
+        # the corresponding local video; never infer from count alone.
+        for record, current in zip(chapters, remote):
+            if record.get("published_sha256") or not isinstance(current, dict):
+                continue
+            remote_name = current.get("filename")
+            local_name = Path(str(record.get("video", ""))).name
+            local_stem = Path(local_name).stem
+            remote_title = str(current.get("title") or "")
+            if remote_name and local_name and (
+                remote_name == local_name
+                or remote_title == local_stem
+                or remote_title.endswith(f"-{record.get('title', '')}")
+            ):
+                record["published_sha256"] = record.get("source_sha256")
+                record["remote_filename"] = remote_name
+                record["remote_cid"] = current.get("cid")
+
         published_count = 0
         for item in chapters:
             if not item.get("published_sha256"):
@@ -539,6 +657,13 @@ class BilibiliService:
                 record["remote_cid"] = current.get("cid")
         publication["remote_mismatch"] = mismatch
         manifest["publication"] = publication
+        pending = manifest.get("pending") or {}
+        completed_parts = pending.get("parts")
+        if pending.get("action") == "append":
+            published_before = pending.get("published_before")
+            completed_parts = published_before + completed_parts if isinstance(published_before, int) and isinstance(completed_parts, int) else None
+        if not mismatch and pending.get("action") in ("publish", "append") and isinstance(completed_parts, int) and published_count >= completed_parts:
+            manifest.pop("pending", None)
 
     def status(self, project_id: str, *, sync_remote: bool = True) -> dict[str, Any]:
         project = self.repo.get_project(project_id)
@@ -569,13 +694,13 @@ class BilibiliService:
                 state = "outdated" if record.get("published_sha256") else "missing"
             elif record.get("remote_mismatch"):
                 state = "remote_mismatch"
-            elif record.get("published_sha256") == record.get("source_sha256"):
-                state = "published"
+            elif record.get("published_sha256"):
+                state = "published" if record["published_sha256"] == record.get("source_sha256") else "outdated"
             else:
                 state = "ready"
-            chapter_states.append({**chapter, "bilibili_state": state, "image_url": f"/api/v1/projects/{project_id}/bilibili/media/{chapter['id']}/image" if record else None, "video_url": f"/api/v1/projects/{project_id}/bilibili/media/{chapter['id']}/video" if record else None})
+            chapter_states.append({**chapter, "position": chapter["included_position"], "bilibili_state": state, "image_url": f"/api/v1/projects/{project_id}/bilibili/media/{chapter['id']}/image" if record else None, "video_url": f"/api/v1/projects/{project_id}/bilibili/media/{chapter['id']}/video" if record else None})
         for item in chapter_states:
-            if item["bilibili_state"] not in ("ready", "published", "remote_mismatch"):
+            if item["bilibili_state"] not in ("ready", "published", "outdated", "remote_mismatch"):
                 break
             prepared_count += 1
         for record in manifest.get("chapters", []):
@@ -610,11 +735,11 @@ class BilibiliService:
             raise KeyError(path)
         return path
 
-    def _apply_remote_mapping(self, manifest: dict[str, Any], studio: dict[str, Any], count: int) -> None:
+    def _apply_remote_mapping(self, manifest: dict[str, Any], studio: dict[str, Any], count: int, start: int = 0) -> None:
         remote = self._remote_videos(studio)
         if len(remote) < count:
             raise RuntimeError(f"bilibili_remote_count_mismatch:{len(remote)}/{count}")
-        for record, item in zip(manifest["chapters"][:count], remote[:count]):
+        for record, item in zip(manifest["chapters"][start:count], remote[start:count]):
             record["published_sha256"] = record["source_sha256"]
             record["remote_filename"] = item.get("filename")
             record["remote_cid"] = item.get("cid")
@@ -703,8 +828,6 @@ class BilibiliService:
         if not bvid:
             raise RuntimeError("bilibili_not_published")
         published = next((index for index, item in enumerate(records) if not item.get("published_sha256")), len(records))
-        if any(item.get("published_sha256") and item.get("published_sha256") != item.get("source_sha256") for item in records[:published]):
-            raise RuntimeError("bilibili_replace_outdated_first")
         parts = int(payload["parts"])
         remaining = records[published:]
         if parts < 1 or parts > len(remaining):
@@ -722,7 +845,7 @@ class BilibiliService:
         if not self._remote_prefix_matches(records, remote, published):
             raise RuntimeError("bilibili_append_remote_state_ambiguous")
         if pending and len(remote) == published + parts:
-            self._apply_remote_mapping(manifest, studio, published + parts)
+            self._apply_remote_mapping(manifest, studio, published + parts, published)
             manifest.pop("pending", None)
             self._sync_remote(manifest)
             self.save_manifest(project_id, manifest)
@@ -738,11 +861,13 @@ class BilibiliService:
         self._run_process(command, root / "last-append.log", log, should_stop)
         studio = self._studio(bvid)
         if len(self._remote_videos(studio)) != published + parts:
+            log(f"本次追加远端分P数量不符：预期共 {published + parts} 个，实际 {len(self._remote_videos(studio))} 个；尚未标记追加成功")
             raise RuntimeError("bilibili_append_remote_state_ambiguous")
-        self._apply_remote_mapping(manifest, studio, published + parts)
+        self._apply_remote_mapping(manifest, studio, published + parts, published)
         manifest.pop("pending", None)
         self._sync_remote(manifest)
         self.save_manifest(project_id, manifest)
+        log(f"本次追加 {parts}/{parts} 个分P已获远端确认，共 {published + parts} 个分P")
 
     def _edit_studio(self, studio: dict[str, Any]) -> None:
         login = self._cookie_data()
@@ -750,7 +875,9 @@ class BilibiliService:
         csrf = cookies.get("bili_jct")
         if not csrf:
             raise RuntimeError("bilibili_csrf_missing")
-        response = httpx.post(EDIT_URL, params={"t": int(time.time() * 1000), "csrf": csrf}, cookies=cookies, json=studio, timeout=30)
+        response = httpx.post(EDIT_URL, params={"t": int(time.time() * 1000), "csrf": csrf}, cookies=cookies, headers=BILI_MEMBER_HEADERS, json=studio, timeout=30)
+        if response.status_code == 412:
+            raise RuntimeError("bilibili_edit_blocked")
         response.raise_for_status()
         payload = response.json()
         if payload.get("code") != 0:
@@ -822,7 +949,13 @@ class BilibiliService:
         handler = {"prepare": self.prepare, "publish": self.publish, "append": self.append, "replace": self.replace}.get(action)
         if handler is None:
             raise ValueError("Invalid B站 job action")
+        def upload_log(message: str) -> None:
+            match = re.search(r"Checkpoint saved: (\d+) files uploaded", message)
+            if match:
+                self.repo.update_job_payload(job["id"], {"uploaded_parts": int(match[1])})
+            log(message)
+
         if action == "prepare":
             handler(job["project_id"], log, should_stop)
         else:
-            handler(job["project_id"], job["payload"], log, should_stop)
+            handler(job["project_id"], job["payload"], upload_log, should_stop)

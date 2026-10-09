@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import httpx
+
 from backend.alexandria.db.database import Database
 from backend.alexandria.db.repository import Repository
 from backend.alexandria.services.bilibili import BilibiliService
@@ -55,8 +57,49 @@ class BilibiliTests(unittest.TestCase):
         self.repo.set_chapter_inclusion("book", [chapters[1]["id"], chapters[2]["id"]])
         self.artifact(1)
         self.artifact(2)
-        self.assertEqual([item["position"] for item in self.service._continuous_audio("book")], [1, 2])
-        self.assertEqual([item["position"] for item in self.service.status("book", sync_remote=False)["chapters"]], [2, 3])
+        continuous = self.service._continuous_audio("book")
+        self.assertEqual([item["position"] for item in continuous], [2, 3])
+        self.assertEqual([item["included_position"] for item in continuous], [1, 2])
+        status = self.service.status("book", sync_remote=False)["chapters"]
+        self.assertEqual([item["position"] for item in status], [1, 2])
+        self.assertEqual([item["included_position"] for item in status], [1, 2])
+
+    def test_prepare_uses_continuous_included_position_in_manifest_and_video_name(self):
+        chapters = self.repo.list_chapters("book")
+        self.repo.set_chapter_inclusion("book", [chapters[1]["id"], chapters[2]["id"]])
+        self.artifact(1)
+        self.artifact(2)
+
+        def render(_image, _audio, output, _title, _ffmpeg, _log, _stop):
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(b"video")
+
+        def download(path):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"image")
+            return "https://image"
+
+        with patch("backend.alexandria.services.bilibili.shutil.which", side_effect=lambda name: name), \
+             patch.object(self.service, "_probe_audio", return_value=2.5), \
+             patch.object(self.service, "_validate_video", return_value=2.5), \
+             patch.object(self.service, "_render_video", side_effect=render), \
+             patch.object(self.service, "_download_image", side_effect=download):
+            self.service.prepare("book", lambda _message: None, lambda: False)
+
+        records = self.service.load_manifest("book")["chapters"]
+        self.assertEqual([item["included_position"] for item in records], [1, 2])
+        self.assertEqual([Path(item["video"]).name for item in records], ["0001-二.mp4", "0002-三.mp4"])
+        self.assertTrue(all("position" not in item for item in records))
+
+    def test_old_manifest_gets_continuous_included_positions(self):
+        self.service.save_manifest("book", {
+            "status": "ready",
+            "chapters": [{"chapter_id": 2, "position": 2}, {"chapter_id": 3, "position": 3}],
+        })
+
+        _manifest, records = self.service._prepared_records("book")
+
+        self.assertEqual([item["included_position"] for item in records], [1, 2])
 
     def test_job_payload_is_persisted(self):
         job = self.repo.create_job("book", "bilibili", {"action": "prepare"})
@@ -78,6 +121,26 @@ class BilibiliTests(unittest.TestCase):
         })
         state = self.service.status("book", sync_remote=False)
         self.assertEqual(state["chapters"][0]["bilibili_state"], "outdated")
+
+    def test_prepared_replacement_stays_outdated_until_published(self):
+        artifact = self.artifact(0, b"new")
+        chapter = self.repo.list_chapters("book")[0]
+        root = self.service._root("book")
+        (root / "videos").mkdir(parents=True)
+        (root / "videos" / "one.mp4").write_bytes(b"video")
+        self.service.save_manifest("book", {
+            "version": 1,
+            "status": "ready",
+            "chapters": [{
+                "chapter_id": chapter["id"], "source_sha256": artifact["sha256"], "published_sha256": "old",
+                "video": "videos/one.mp4", "image": "images/one.jpg", "audio_path": artifact["path"],
+            }],
+        })
+
+        state = self.service.status("book", sync_remote=False)
+
+        self.assertEqual(state["chapters"][0]["bilibili_state"], "outdated")
+        self.assertEqual(state["prepared_count"], 1)
 
     def test_media_path_cannot_escape_project_directory(self):
         chapter = self.repo.list_chapters("book")[0]
@@ -190,6 +253,27 @@ class BilibiliTests(unittest.TestCase):
         self.assertTrue(manifest["publication"]["remote_mismatch"])
         self.assertEqual(manifest["chapters"][0]["remote_filename"], "expected")
 
+    def test_sync_remote_recovers_uploaded_part_from_remote_title(self):
+        manifest = {
+            "form": {"visibility": "only_self"},
+            "publication": {"bvid": "BV1234567890", "title": "稿件"},
+            "pending": {"action": "publish", "parts": 1},
+            "chapters": [{
+                "source_sha256": "sha",
+                "video": "videos/0001-一.mp4",
+            }],
+        }
+        with patch.object(self.service, "_studio", return_value={
+            "title": "稿件", "is_only_self": 1,
+            "videos": [{"title": "0001-一", "filename": "remote-name", "cid": 2}],
+        }):
+            self.service._sync_remote(manifest)
+        record = manifest["chapters"][0]
+        self.assertEqual(record["published_sha256"], "sha")
+        self.assertEqual(record["remote_filename"], "remote-name")
+        self.assertFalse(manifest["publication"]["remote_mismatch"])
+        self.assertNotIn("pending", manifest)
+
     def test_publish_and_append_update_remote_mapping(self):
         records = [
             {"chapter_id": 1, "source_sha256": "one", "video": "videos/1.mp4", "image": "images/1.jpg"},
@@ -209,6 +293,7 @@ class BilibiliTests(unittest.TestCase):
         self.assertEqual(records[0]["published_sha256"], "one")
         self.assertEqual(manifest["publication"]["bvid"], "BV1234567890")
 
+        records[0]["source_sha256"] = "one-changed"
         remote_two = {"title": "title", "is_only_self": 1, "videos": [{"filename": "one", "cid": 1}, {"filename": "two", "cid": 2}]}
         with patch.object(self.service, "_prepared_records", return_value=(manifest, records)), \
              patch.object(self.service, "_validate_records"), \
@@ -219,6 +304,7 @@ class BilibiliTests(unittest.TestCase):
              patch.object(self.service, "save_manifest"):
             self.service.append("book", {"parts": 1, "line": "cnbldsa"}, lambda _message: None, lambda: False)
         self.assertEqual(records[1]["published_sha256"], "two")
+        self.assertEqual(records[0]["published_sha256"], "one")
 
     def test_append_recovers_when_remote_edit_finished(self):
         records = [
@@ -260,6 +346,41 @@ class BilibiliTests(unittest.TestCase):
         self.assertNotIn("pending", manifest)
         self.assertEqual(records[0]["remote_filename"], "new")
 
+    def test_append_does_not_mark_ten_published_when_remote_added_only_one(self):
+        records = [{"chapter_id": i, "source_sha256": str(i), "video": f"videos/{i}.mp4"} for i in range(11)]
+        records[0].update(published_sha256="0", remote_filename="first")
+        manifest = {"status": "ready", "chapters": records, "publication": {"bvid": "BV1234567890"}}
+        initial = {"videos": [{"filename": "first"}]}
+        partial = {"videos": [{"filename": "first"}, {"filename": "second"}]}
+        with patch.object(self.service, "_prepared_records", return_value=(manifest, records)), \
+             patch.object(self.service, "_validate_records"), \
+             patch.object(self.service, "_ensure_biliup", return_value=Path("biliup.exe")), \
+             patch.object(self.service, "_run_process", return_value="done"), \
+             patch.object(self.service, "_studio", side_effect=[initial, partial]):
+            with self.assertRaisesRegex(RuntimeError, "bilibili_append_remote_state_ambiguous"):
+                self.service.append("book", {"parts": 10}, lambda _message: None, lambda: False)
+        self.assertTrue(all(not record.get("published_sha256") for record in records[1:]))
+        self.assertEqual(self.service.load_manifest("book")["pending"]["parts"], 10)
+
+    def test_upload_progress_is_persisted_per_job_before_emitting_logs(self):
+        job = self.repo.create_job("book", "bilibili", {"action": "append", "parts": 10})
+        messages = []
+
+        def append(_project, _payload, log, _stop):
+            log("Checkpoint saved: 4 files uploaded")
+
+        def log(message):
+            self.assertEqual(self.repo.get_job(job["id"])["payload"]["uploaded_parts"], 4)
+            messages.append(message)
+
+        with patch.object(self.service, "append", side_effect=append):
+            self.service.run(job, log, lambda: False)
+        self.assertEqual(messages, ["Checkpoint saved: 4 files uploaded"])
+        self.assertEqual(self.repo.get_job(job["id"])["payload"]["parts"], 10)
+        self.repo.set_job_status(job["id"], "completed")
+        new_job = self.repo.create_job("book", "bilibili", {"action": "append", "parts": 10})
+        self.assertNotIn("uploaded_parts", new_job["payload"])
+
     @patch("backend.alexandria.services.bilibili.httpx.post")
     def test_qr_pending_success_and_expiry(self, post: Mock):
         start = Mock()
@@ -273,11 +394,56 @@ class BilibiliTests(unittest.TestCase):
         success.json.return_value = {"code": 0, "data": {"cookie_info": {"cookies": []}, "token_info": {"access_token": "token"}}}
         post.side_effect = [start, pending, success]
         login = self.service.start_login()
+        self.assertEqual(post.call_args_list[0].kwargs["headers"]["Referer"], "https://www.bilibili.com/")
         self.assertEqual(self.service.poll_login(login["session_id"])["status"], "pending")
+        self.assertEqual(post.call_args_list[1].kwargs["headers"]["User-Agent"].split("/", 1)[0], "Mozilla")
         with patch.object(self.service, "account_status", return_value={"logged_in": True, "name": "tester"}):
             self.assertEqual(self.service.poll_login(login["session_id"]), {"status": "success", "name": "tester"})
         stored = json.loads(self.service.cookie_path.read_text(encoding="utf-8"))
         self.assertEqual(stored["platform"], "BiliTV")
+
+    @patch("backend.alexandria.services.bilibili.httpx.post")
+    def test_qr_login_412_has_retryable_error(self, post: Mock):
+        blocked = Mock(status_code=412)
+        post.return_value = blocked
+
+        with self.assertRaisesRegex(RuntimeError, "bilibili_login_blocked"):
+            self.service.start_login()
+
+    @patch("backend.alexandria.services.bilibili.httpx.post", side_effect=httpx.ConnectError("offline"))
+    def test_qr_login_network_error_is_wrapped(self, _post: Mock):
+        with self.assertRaisesRegex(RuntimeError, "bilibili_login_start_failed"):
+            self.service.start_login()
+
+    @patch("openai.OpenAI")
+    def test_extract_metadata_uses_book_source_and_returns_fields(self, openai_cls: Mock):
+        response = Mock()
+        response.choices = [Mock(message=Mock(content='{"author":"作者甲","publisher":"出版社乙","description":"一段简介"}'))]
+        openai_cls.return_value.chat.completions.create.return_value = response
+
+        metadata = self.service.extract_metadata("book")
+
+        self.assertEqual(metadata, {"author": "作者甲", "publisher": "出版社乙", "description": "一段简介"})
+        request = openai_cls.return_value.chat.completions.create.call_args.kwargs
+        self.assertIn("一", request["messages"][1]["content"])
+        self.assertIn("二", request["messages"][1]["content"])
+        self.assertEqual(request["reasoning_effort"], "none")
+        self.assertEqual(request["response_format"]["type"], "json_schema")
+
+    @patch("openai.OpenAI")
+    def test_extract_metadata_accepts_json_code_fence_and_empty_fields(self, openai_cls: Mock):
+        response = Mock()
+        response.choices = [Mock(message=Mock(content='```json\n{"author":"","publisher":"","description":"简介"}\n```'))]
+        openai_cls.return_value.chat.completions.create.return_value = response
+
+        self.assertEqual(self.service.extract_metadata("book"), {"author": "", "publisher": "", "description": "简介"})
+
+    @patch("openai.OpenAI")
+    def test_extract_metadata_wraps_llm_errors(self, openai_cls: Mock):
+        openai_cls.return_value.chat.completions.create.side_effect = RuntimeError("provider failed")
+
+        with self.assertRaisesRegex(RuntimeError, "bilibili_metadata_failed"):
+            self.service.extract_metadata("book")
 
 
 if __name__ == "__main__":

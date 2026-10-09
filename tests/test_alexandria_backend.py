@@ -63,13 +63,13 @@ class RepositoryTests(RepositoryTestCase):
             stage = session.query(StageRun).one()
             self.assertEqual(stage.attempts, 1)
 
-    def test_defaults_and_single_active_job(self):
+    def test_defaults_and_multiple_jobs_can_queue(self):
         first = self.project()
         second = self.project()
         self.assertEqual(first["settings"]["release_batch_size"], 3)
-        self.repo.create_job(first["id"])
-        with self.assertRaisesRegex(RuntimeError, "active_job"):
-            self.repo.create_job(second["id"])
+        first_job = self.repo.create_job(first["id"])
+        second_job = self.repo.create_job(second["id"])
+        self.assertEqual([first_job["status"], second_job["status"]], ["queued", "queued"])
 
     def test_archive_restore_delete_and_active_job_protection(self):
         project = self.project()
@@ -130,6 +130,19 @@ class RepositoryTests(RepositoryTestCase):
         for thread in threads:
             thread.join()
         self.assertEqual(published, sorted(published))
+
+    def test_events_default_to_latest_fifty_and_after_remains_incremental(self):
+        project = self.project()
+        job = self.repo.create_job(project["id"])
+        for number in range(60):
+            self.repo.add_event(job["id"], project["id"], "test", {"number": number})
+
+        latest = self.repo.list_events(project["id"])
+
+        self.assertEqual(len(latest), 50)
+        self.assertEqual([event["event_id"] for event in latest], sorted(event["event_id"] for event in latest))
+        self.assertEqual(latest[0]["payload"]["number"], 10)
+        self.assertEqual([event["payload"]["number"] for event in self.repo.list_events(project["id"], after=latest[-2]["event_id"])], [59])
 
     def test_voice_assignment_uses_explicit_choice_and_gender_without_persisting_random_choice(self):
         project = self.project()
@@ -402,7 +415,8 @@ class PipelineTests(RepositoryTestCase):
         self.assertEqual(len(executor.reviewed), 2)
         self.assertEqual(executor.rendered, [])
         self.assertEqual(executor.merged, 0)
-        self.assertEqual(self.repo.get_project(project["id"])["status"], "ready_for_tts")
+        self.assertEqual(self.repo.get_project(project["id"])["status"], "queued")
+        self.assertEqual(self.repo.get_project(project["id"])["latest_job"]["type"], "character_analysis")
 
         render = self.repo.create_job(project["id"], "render")
         PipelineRunner(self.repo, executor, EventBroker()).run(render["id"])
@@ -444,20 +458,23 @@ class PipelineTests(RepositoryTestCase):
         self.assertEqual(executor.reviewed, [])
         self.assertEqual(self.repo.get_job(job["id"])["status"], "completed")
 
-    def test_automatic_character_analysis_failure_does_not_fail_preprocess(self):
+    def test_automatic_character_analysis_is_independent_from_preprocess(self):
         project = self.project(1)
         executor = FakeExecutor(self.repo)
         job = self.repo.create_job(project["id"], "preprocess")
 
+        runner = PipelineRunner(self.repo, executor, EventBroker())
+        runner.run(job["id"])
+        analysis = self.repo.get_project(project["id"])["latest_job"]
         with patch.object(executor, "analyze_characters", side_effect=RuntimeError("analysis failed")):
-            PipelineRunner(self.repo, executor, EventBroker()).run(job["id"])
+            runner.run(analysis["id"])
 
         self.assertEqual(self.repo.get_job(job["id"])["status"], "completed")
-        self.assertEqual(self.repo.get_project(project["id"])["status"], "ready_for_tts")
+        self.assertEqual(self.repo.get_job(analysis["id"])["status"], "failed")
+        self.assertEqual(self.repo.get_project(project["id"])["status"], "failed")
         events = self.repo.list_events(project["id"])
-        self.assertTrue(any(event["type"] == "characters.failed" and event["payload"]["error"] == "analysis failed" for event in events))
         self.assertTrue(any(event["type"] == "log" and event["payload"]["channel"] == "character_analysis" for event in events))
-        self.assertEqual(self.repo.create_job(project["id"], "character_analysis")["type"], "character_analysis")
+        self.assertEqual(self.repo.retry_job(analysis["id"])["status"], "queued")
 
     def test_render_range_rejects_zero_out_of_bounds_and_non_numeric_values(self):
         project = self.project(2)
@@ -485,6 +502,57 @@ class PipelineTests(RepositoryTestCase):
 
         self.assertEqual(executor.rendered, [chapters[1]["id"]])
         self.assertEqual(self.repo.get_job(job["id"])["status"], "completed")
+
+    def test_resumed_render_skips_completed_chapter_with_valid_audio(self):
+        project = self.project(2)
+        chapters = self.repo.list_chapters(project["id"])
+        for chapter in chapters:
+            self.repo.save_revision(chapter["id"], "reviewed", [{"speaker": "NARRATOR", "text": "text", "instruct": ""}])
+        job = self.repo.create_job(project["id"], "render")
+        audio = self.repo.storage_root / "projects" / project["id"] / "output" / "1.mp3"
+        audio.parent.mkdir(parents=True, exist_ok=True)
+        audio.write_bytes(b"mp3")
+        self.repo.save_artifact(project["id"], chapters[0]["id"], "chapter_mp3", audio)
+        self.repo.update_stage(job["id"], chapters[0]["id"], "render", "completed")
+        self.repo.set_job_status(job["id"], "paused")
+        self.repo.resume_job(job["id"])
+        executor = FakeExecutor(self.repo)
+
+        PipelineRunner(self.repo, executor, EventBroker()).run(job["id"])
+
+        self.assertEqual(executor.rendered, [chapters[1]["id"]])
+        self.assertEqual(executor.merged, 1)
+        messages = [event["payload"].get("message") for event in self.repo.list_events(project["id"]) if event["type"] == "log"]
+        self.assertIn("第 1 章已有有效音频，已跳过", messages)
+
+    def test_completed_render_reruns_when_audio_is_missing(self):
+        project = self.project(1)
+        chapter = self.repo.list_chapters(project["id"])[0]
+        self.repo.save_revision(chapter["id"], "reviewed", [{"speaker": "NARRATOR", "text": "text", "instruct": ""}])
+        job = self.repo.create_job(project["id"], "render")
+        self.repo.update_stage(job["id"], chapter["id"], "render", "completed")
+        self.repo.set_job_status(job["id"], "paused")
+        self.repo.resume_job(job["id"])
+        executor = FakeExecutor(self.repo)
+
+        PipelineRunner(self.repo, executor, EventBroker()).run(job["id"])
+
+        self.assertEqual(executor.rendered, [chapter["id"]])
+
+    def test_new_render_job_does_not_skip_existing_chapter_audio(self):
+        project = self.project(1)
+        chapter = self.repo.list_chapters(project["id"])[0]
+        self.repo.save_revision(chapter["id"], "reviewed", [{"speaker": "NARRATOR", "text": "text", "instruct": ""}])
+        audio = self.repo.storage_root / "projects" / project["id"] / "output" / "old.mp3"
+        audio.parent.mkdir(parents=True, exist_ok=True)
+        audio.write_bytes(b"old")
+        self.repo.save_artifact(project["id"], chapter["id"], "chapter_mp3", audio)
+        job = self.repo.create_job(project["id"], "render")
+        executor = FakeExecutor(self.repo)
+
+        PipelineRunner(self.repo, executor, EventBroker()).run(job["id"])
+
+        self.assertEqual(executor.rendered, [chapter["id"]])
 
     def test_merge_job_requires_all_chapter_audio_and_merges_all_chapters(self):
         project = self.project(2)
@@ -661,6 +729,35 @@ class PipelineTests(RepositoryTestCase):
         with self.database.session() as session:
             self.assertEqual(session.query(AudioSegment).count(), 0)
         self.assertEqual(list((self.repo.storage_root / "projects" / project["id"] / "audio").rglob("*.mp3")), [])
+
+    def test_render_logs_segment_position_and_total(self):
+        from fish_adapter.renderer import FishRenderer, RenderResult
+
+        project = self.project(2)
+        chapters = self.repo.list_chapters(project["id"])
+        self.repo.set_chapter_inclusion(project["id"], [chapters[1]["id"]])
+        chapter = self.repo.list_included_chapters(project["id"])[0]
+        self.repo.save_revision(chapter["id"], "reviewed", [
+            {"speaker": "NARRATOR", "text": f"line {index}", "instruct": ""}
+            for index in range(1, 3)
+        ])
+        voices = self.repo.replace_voices([{"reference_id": "narrator", "name": "Narrator", "pool_order": 0}])
+        self.repo.update_project_voice_pool(project["id"], [], voices[0]["id"])
+        self.repo.update_settings({"fish_api_key": "secret", "fish_workers": 1})
+        messages = []
+
+        def merge(_files, output, **_kwargs):
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(b"chapter")
+
+        with (
+            patch.object(FishRenderer, "synthesize", return_value=RenderResult(audio=b"mp3", attempts=1)),
+            patch("tools.render_book.merge_mp3", merge),
+        ):
+            StageExecutor(self.repo, Path(__file__).parents[1]).render(chapter["id"], project, messages.append)
+
+        self.assertIn("第 1 章片段 1 / 2 已渲染", messages)
+        self.assertIn("第 1 章片段 2 / 2 已渲染", messages)
 
     def test_render_stop_during_write_removes_audio(self):
         from fish_adapter.renderer import FishRenderer, RenderResult
