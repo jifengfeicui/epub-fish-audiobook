@@ -88,4 +88,7 @@ frontend/dist/
 frontend/test-results/
 frontend/playwright-report/
 frontend/*.tsbuildinfo
+/test-results/
+/bilibili-validation-*/
+/secrets/
 

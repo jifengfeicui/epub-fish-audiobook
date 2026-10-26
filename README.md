@@ -8,6 +8,8 @@ For development, install `backend/requirements.txt` and the `frontend` npm depen
 
 The CLI uses the same default: `python tools/render_book.py --epub book.epub --render-start after-review-batch --release-batch-size 3`. Use `--render-start after-all-reviews` for the previous wait-for-the-whole-book behavior.
 
+The web app includes Bilibili publishing. For existing chapter MP3 files, the [standalone publishing CLI](tools/bilibili_cli/README.md) can prepare videos, publish, and append parts. Its source and tests live in this repository; books, generated files, validation data, and login credentials stay local.
+
 English | [中文](README_CN.md)
 
 > **A note to new users:** Alexandria has recently seen a sudden surge of attention and new users. As a small project, I may not be able to respond to every issue promptly. Before opening an issue, please read this README and the [Wiki](https://github.com/Finrandojin/alexandria-audiobook/wiki) thoroughly — most common questions are already answered there. Thank you for your patience!

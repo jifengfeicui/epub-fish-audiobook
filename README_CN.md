@@ -8,6 +8,8 @@
 
 CLI 使用相同默认值：`python tools/render_book.py --epub book.epub --render-start after-review-batch --release-batch-size 3`。如需兼容原先等待全书 Review 完成的行为，使用 `--render-start after-all-reviews`。
 
+网页已集成 B 站投稿功能。已有章节 MP3 也可使用[独立投稿 CLI](tools/bilibili_cli/README.md)生成视频、首发和追加分P；源码与测试统一维护在本仓库，书籍、生成文件、验证数据和登录凭据不提交。
+
 [English](README.md) | 中文
 
 > **致新用户：** 感谢大家的关注！Alexandria 近期突然获得了大量关注，新用户涌入的速度远超预期。作为一个小型项目，我们可能无法及时回复每一个 Issue。在提交问题之前，请先仔细阅读本文档和 [Wiki](https://github.com/Finrandojin/alexandria-audiobook/wiki)，其中涵盖了大部分常见问题的解答。感谢大家的耐心与理解！

@@ -1,0 +1,6 @@
+work/
+tools/
+secrets/
+__pycache__/
+*.log
+qrcode.png
