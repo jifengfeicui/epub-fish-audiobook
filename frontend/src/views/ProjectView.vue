@@ -7,6 +7,7 @@ import { connectProjectEvents } from '../api/events'
 import { useProjectsStore } from '../stores/projects'
 import StatusBadge from '../components/StatusBadge.vue'
 import BilibiliPanel from '../components/BilibiliPanel.vue'
+import AgentPanel from '../components/AgentPanel.vue'
 import type { BilibiliStatus, JobEvent, Script } from '../types'
 
 interface VoiceProfile { id: string; name: string; gender: string; traits: string; enabled: boolean; sample_available: boolean; sample_url: string | null }
@@ -16,13 +17,16 @@ const router = useRouter()
 const store = useProjectsStore()
 const selectedId = ref<number | null>(null)
 const script = ref<Script | null>(null)
+const savedScript = ref('')
+const scriptContent = () => JSON.stringify(script.value?.entries.map(({ speaker, text, instruct }) => ({ speaker, text, instruct })) || [])
+const scriptDirty = computed(() => script.value !== null && scriptContent() !== savedScript.value)
 const saving = ref(false)
 const message = ref('')
 const voices = ref<VoiceProfile[]>([])
 const excludedVoiceIds = ref<string[]>([])
 const narratorVoiceId = ref<string | null>(null)
 const connected = ref(false)
-const activeTab = ref<'chapters' | 'characters' | 'settings' | 'artifacts' | 'bilibili' | 'logs'>('chapters')
+const activeTab = ref<'chapters' | 'characters' | 'settings' | 'artifacts' | 'bilibili' | 'logs' | 'agent'>('chapters')
 const rangeJobType = ref<'preprocess' | 'render' | null>(null)
 const rangeFrom = ref<number | ''>(1)
 const rangeTo = ref<number | ''>(1)
@@ -136,7 +140,8 @@ async function refresh() {
   if (!chapterSelectionDirty.value) includedChapterIds.value = store.chapters.filter(chapter => chapter.included).map(chapter => chapter.id)
   if (selectedId.value === null && store.chapters[0]) await selectChapter((store.chapters.find(chapter => chapter.included) || store.chapters[0]).id)
   else if (selectedId.value !== null && selectedId.value === previousChapterId && activeChapter.value?.active_revision_id !== previousRevision) {
-    await selectChapter(selectedId.value)
+    if (scriptDirty.value) message.value = '服务器脚本已有新修订，当前人工编辑已保留。请保存以检查冲突，或放弃后载入新版本。'
+    else await selectChapter(selectedId.value)
   }
 }
 function setChapterIncluded(id: number, included: boolean) {
@@ -181,9 +186,19 @@ async function saveCharacters() {
     message.value = '角色池已保存，相关音频已标记为待重渲染'
   } catch (reason) { message.value = (reason as Error).message }
 }
-async function selectChapter(id: number) {
+async function selectChapter(id: number, discard = false) {
+  if (scriptDirty.value && !discard) { message.value = '请先保存或放弃当前章节的人工编辑'; return }
+  const loaded = await api.get<Script>(`/api/v1/chapters/${id}/script`)
   selectedId.value = id
-  script.value = await api.get<Script>(`/api/v1/chapters/${id}/script`)
+  script.value = loaded
+  savedScript.value = scriptContent()
+}
+async function discardScript() {
+  if (selectedId.value !== null) await selectChapter(selectedId.value, true)
+}
+async function agentChanged() {
+  await refresh()
+  if (selectedId.value !== null && !scriptDirty.value) await selectChapter(selectedId.value)
 }
 async function startJob(type: 'merge' | 'character_analysis') {
   message.value = ''
@@ -228,7 +243,7 @@ async function control(action: 'pause' | 'resume' | 'retry' | 'cancel') { if (jo
 async function saveScript() {
   if (!script.value || !activeChapter.value) return
   saving.value = true; message.value = ''
-  try { script.value = await api.patch<Script>(`/api/v1/chapters/${activeChapter.value.id}/script`, { expected_revision: script.value.revision, entries: script.value.entries.map(({ speaker, text, instruct }) => ({ speaker, text, instruct })) }); message.value = '脚本已保存，章节音频已标记为待重渲染'; await refresh() }
+  try { script.value = await api.patch<Script>(`/api/v1/chapters/${activeChapter.value.id}/script`, { expected_revision: script.value.revision, entries: script.value.entries.map(({ speaker, text, instruct }) => ({ speaker, text, instruct })) }); savedScript.value = scriptContent(); message.value = '脚本已保存，章节音频已标记为待重渲染'; await refresh() }
   catch (reason) { message.value = (reason as Error).message }
   finally { saving.value = false }
 }
@@ -252,6 +267,7 @@ onBeforeUnmount(() => { window.clearTimeout(refreshTimer); previewAudio?.pause()
     <p v-if="message" class="inline-message">{{ message }}</p>
     <div class="section-layout project-section-layout">
       <nav class="section-nav" aria-label="项目内容">
+        <button :class="{ active: activeTab === 'agent' }" @click="activeTab = 'agent'"><ScrollText :size="17" /><span>Agent 助手</span></button>
         <button :class="{ active: activeTab === 'chapters' }" @click="activeTab = 'chapters'"><BookOpenText :size="17" /><span>章节</span><small>{{ includedChapterIds.length }}</small></button>
         <button :class="{ active: activeTab === 'characters' }" @click="activeTab = 'characters'"><Users :size="17" /><span>角色池</span><small>{{ store.characters.length }}</small></button>
         <button :class="{ active: activeTab === 'settings' }" @click="activeTab = 'settings'"><Settings2 :size="17" /><span>项目设置</span></button>
@@ -262,11 +278,12 @@ onBeforeUnmount(() => { window.clearTimeout(refreshTimer); previewAudio?.pause()
       <div class="section-content">
         <div v-if="activeTab === 'chapters'" class="workspace-grid">
       <aside class="chapter-list panel"><div class="panel-heading"><div><h2>章节</h2><small>已启用 {{ includedChapterIds.length }} / {{ store.chapters.length }}</small></div><button class="button secondary chapter-save" :disabled="running || savingChapters || !chapterSelectionDirty" @click="saveChapterSelection"><Save :size="14" />保存</button></div><div v-for="chapter in store.chapters" :key="chapter.id" class="chapter-item-row" :class="{ excluded: !includedIdSet.has(chapter.id) }"><button class="chapter-item" :class="{ selected: selectedId === chapter.id }" @click="selectChapter(chapter.id)"><span class="chapter-number">{{ chapterDisplayPosition(chapter.id) ? String(chapterDisplayPosition(chapter.id)).padStart(2, '0') : '--' }}</span><span class="chapter-title">{{ chapter.title }}</span><span v-if="!includedIdSet.has(chapter.id)" class="chapter-excluded">已禁用</span><StatusBadge v-else :status="chapter.status" /></button><button class="chapter-toggle" :class="{ enable: !includedIdSet.has(chapter.id) }" :title="includedIdSet.has(chapter.id) ? '禁用本章' : '启用本章'" :aria-label="includedIdSet.has(chapter.id) ? `禁用原第 ${chapter.position} 章` : `启用原第 ${chapter.position} 章`" :disabled="running" @click.stop="setChapterIncluded(chapter.id, !includedIdSet.has(chapter.id))"><Ban v-if="includedIdSet.has(chapter.id)" :size="14" /><Check v-else :size="14" /></button></div></aside>
-      <section class="script-panel panel"><div class="panel-heading"><div><h2>{{ activeChapter?.title || '选择章节' }}</h2><span v-if="script" class="muted">{{ script.kind || '尚未生成' }} · 修订 {{ script.revision }}</span></div><div v-if="script" class="heading-actions"><button class="icon-button" title="添加条目" :disabled="!scriptEditable" @click="addEntry">＋</button><button class="button secondary" :disabled="saving || !scriptEditable" @click="saveScript"><Save :size="16" />{{ saving ? '保存中' : '保存脚本' }}</button></div></div><div v-if="script" class="entry-list"><div v-for="(entry, index) in script.entries" :key="entry.id || index" class="entry-row"><span class="entry-index">{{ String(index + 1).padStart(3, '0') }}</span><div class="entry-fields"><input v-model="entry.speaker" aria-label="说话人" :disabled="!scriptEditable" /><textarea v-model="entry.text" rows="2" aria-label="文本" :disabled="!scriptEditable" /><input v-model="entry.instruct" placeholder="Fish voice direction" aria-label="语气指令" :disabled="!scriptEditable" /></div><button class="remove-entry" title="删除条目" :disabled="!scriptEditable" @click="removeEntry(index)">×</button></div></div><div v-else class="empty-script">选择章节查看脚本</div></section>
+      <section class="script-panel panel"><div class="panel-heading"><div><h2>{{ activeChapter?.title || '选择章节' }}</h2><span v-if="script" class="muted">{{ script.kind || '尚未生成' }} · 修订 {{ script.revision }}</span></div><div v-if="script" class="heading-actions"><button v-if="scriptDirty" class="button secondary" @click="discardScript">放弃人工编辑</button><button class="icon-button" title="添加条目" :disabled="!scriptEditable" @click="addEntry">＋</button><button class="button secondary" :disabled="saving || !scriptEditable" @click="saveScript"><Save :size="16" />{{ saving ? '保存中' : '保存脚本' }}</button></div></div><div v-if="script" class="entry-list"><div v-for="(entry, index) in script.entries" :key="entry.id || index" class="entry-row"><span class="entry-index">{{ String(index + 1).padStart(3, '0') }}</span><div class="entry-fields"><input v-model="entry.speaker" aria-label="说话人" :disabled="!scriptEditable" /><textarea v-model="entry.text" rows="2" aria-label="文本" :disabled="!scriptEditable" /><input v-model="entry.instruct" placeholder="Fish voice direction" aria-label="语气指令" :disabled="!scriptEditable" /></div><button class="remove-entry" title="删除条目" :disabled="!scriptEditable" @click="removeEntry(index)">×</button></div></div><div v-else class="empty-script">选择章节查看脚本</div></section>
         </div>
         <section v-else-if="activeTab === 'characters'" class="character-panel panel"><div class="panel-heading"><div><h2>项目角色池</h2><span class="muted">{{ pendingCharacterCount ? `${pendingCharacterCount} 个角色等待分析` : '角色资料已分析' }}；未选音色时按性别从项目可用池随机</span></div><div class="heading-actions"><button class="button secondary" :disabled="running || !store.characters.length" @click="startJob('character_analysis')"><RefreshCw :size="15" />{{ pendingCharacterCount ? '分析角色' : '重新检查' }}</button><button class="button secondary" :disabled="running" @click="saveCharacters"><Save :size="15" />保存角色池</button></div></div><div v-if="store.characters.length" class="character-table"><div class="character-row character-head"><span>角色</span><span>重要度</span><span>性别</span><span>性格简介</span><span>音色与备注</span></div><div v-for="character in store.characters" :key="character.speaker" class="character-row"><strong>{{ character.speaker }}</strong><small>{{ character.importance }} 字 / {{ character.line_count }} 条</small><input v-model="character.gender" placeholder="未知" :disabled="running" /><input v-model="character.personality" placeholder="等待自动分析" :disabled="running" /><div class="character-voice"><select v-model="character.voice_profile_id" :disabled="running"><option :value="null">未绑定（随机）</option><option v-for="voice in characterVoices(character.voice_profile_id)" :key="voice.id" :value="voice.id">{{ voice.name }}{{ voice.gender ? ` · ${voice.gender}` : '' }}{{ voice.traits ? ` · ${voice.traits}` : '' }}{{ !allowedVoiceIds.has(voice.id) ? ' · 不可用' : '' }}</option></select><button class="icon-button" title="播放音色示例" :disabled="!selectedVoice(character.voice_profile_id)?.sample_available" @click="playVoice(character.voice_profile_id)"><Play :size="15" /></button><small v-if="selectedVoice(character.voice_profile_id)?.traits">{{ selectedVoice(character.voice_profile_id)?.traits }}</small></div></div></div><div v-else class="muted assignment-empty">预解析完成后自动建立并分析角色池。</div></section>
         <section v-else-if="activeTab === 'settings'" class="panel project-settings-panel"><div class="panel-heading"><div><h2>项目音色</h2><span class="muted">为本项目选择旁白和可供角色使用的音色</span></div><button class="button secondary" :disabled="running" @click="saveVoicePool"><Save :size="15" />保存项目音色</button></div><div class="project-narrator"><label><span>旁白音色</span><select v-model="narratorVoiceId" :disabled="running"><option :value="null">请选择旁白音色</option><option v-for="voice in voices.filter(item => item.enabled)" :key="voice.id" :value="voice.id" :disabled="excludedVoiceIds.includes(voice.id)">{{ voice.name }}{{ voice.gender ? ` · ${voice.gender}` : '' }}{{ voice.traits ? ` · ${voice.traits}` : '' }}</option></select></label><button class="icon-button" type="button" title="播放旁白示例" :disabled="!selectedVoice(narratorVoiceId)?.sample_available" @click="playVoice(narratorVoiceId)"><Play :size="15" /></button></div><div class="project-voice-grid"><label v-for="voice in voices.filter(item => item.enabled)" :key="voice.id"><input type="checkbox" :checked="!excludedVoiceIds.includes(voice.id)" :disabled="running || voice.id === narratorVoiceId" @change="($event.target as HTMLInputElement).checked ? excludedVoiceIds = excludedVoiceIds.filter(id => id !== voice.id) : excludedVoiceIds.push(voice.id)" /><span><strong>{{ voice.name }}</strong><small>{{ [voice.gender, voice.traits, voice.id === narratorVoiceId ? '当前旁白' : ''].filter(Boolean).join(' · ') }}</small></span><button class="icon-button" type="button" title="播放音色示例" :disabled="!voice.sample_available" @click.prevent="playVoice(voice.id)"><Play :size="14" /></button></label></div></section>
         <section v-else-if="activeTab === 'artifacts'" class="artifact-panel panel"><div class="panel-heading"><h2>产物</h2><span class="muted">完成的章节可直接播放或下载</span></div><div v-if="store.artifacts.length" class="artifact-list"><div v-for="artifact in store.artifacts" :key="artifact.id" class="artifact"><span><strong>{{ artifact.kind === 'book_mp3' ? '整书 MP3' : store.chapters.find(c => c.id === artifact.chapter_id)?.included_position ? `第 ${store.chapters.find(c => c.id === artifact.chapter_id)?.included_position} 章` : '已禁用章节' }}</strong><small>{{ (artifact.size / 1024 / 1024).toFixed(1) }} MB</small></span><audio controls preload="none" :src="`/api/v1/artifacts/${artifact.id}/play`" /><a class="icon-button" title="下载音频" :href="`/api/v1/artifacts/${artifact.id}/download`"><Download :size="17" /></a></div></div><div v-else class="muted tab-empty">还没有可下载的音频产物。</div></section>
+        <AgentPanel v-else-if="activeTab === 'agent'" :key="projectId" :project-id="projectId" :chapters="store.chapters" :selected-chapter-id="selectedId" :chapter-title="activeChapter?.title" :dirty="scriptDirty" :editable="scriptEditable" :saving="saving" @changed="agentChanged" @save="saveScript" @discard="discardScript" />
         <BilibiliPanel v-else-if="activeTab === 'bilibili'" :project-id="projectId" :running="running" @refresh="refresh" />
         <section v-else class="log-panel panel"><div class="panel-heading"><h2>活动日志</h2><button class="icon-button" title="刷新" @click="refresh"><RefreshCw :size="16" /></button></div><div class="log-list"><p v-for="event in store.events.slice(-80).reverse()" :key="event.event_id"><time>{{ new Date(event.timestamp).toLocaleTimeString() }}</time><strong>{{ event.type }}</strong><span>{{ String(event.payload.message || event.payload.position || '') }}</span></p><p v-if="!store.events.length" class="muted">任务启动后，阶段日志会显示在这里。</p></div></section>
       </div>

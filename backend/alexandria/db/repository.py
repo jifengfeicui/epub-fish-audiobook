@@ -18,6 +18,7 @@ from sqlalchemy.orm import joinedload, selectinload
 from .database import Database
 from .models import (
     AppSetting,
+    AgentRun,
     Artifact,
     AudioSegment,
     Chapter,
@@ -190,6 +191,8 @@ class Repository:
 
     def delete_project(self, project_id: str) -> None:
         with self.db.session() as session, session.begin():
+            if session.scalar(select(AgentRun.id).where(AgentRun.project_id == project_id, AgentRun.status == "running")):
+                raise RuntimeError("agent_busy")
             project = session.get(Project, project_id)
             if project is None:
                 raise KeyError(project_id)
@@ -222,6 +225,8 @@ class Repository:
         with self.db.session() as session, session.begin():
             record = session.get(Project, project_id)
             active = session.scalar(select(Job.id).where(Job.project_id == project_id, Job.status.in_(ACTIVE_JOB_STATES)).limit(1))
+            if session.scalar(select(AgentRun.id).where(AgentRun.project_id == project_id, AgentRun.status == "running")):
+                raise RuntimeError("agent_busy")
             if active:
                 raise RuntimeError("project_running")
             session.execute(delete(Job).where(Job.project_id == project_id))
@@ -381,27 +386,32 @@ class Repository:
             ],
         }
 
-    def save_revision(self, chapter_id: int, kind: str, entries: list[dict[str, str]], input_hash: str | None = None) -> dict[str, Any]:
+    def _save_revision(self, session, chapter: Chapter, kind: str, entries: list[dict[str, str]], input_hash: str | None = None) -> dict[str, Any]:
         normalized = [
             {"speaker": row["speaker"].strip(), "text": row["text"], "instruct": row.get("instruct", "").strip()}
             for row in entries
         ]
-        content_hash = _hash_json(normalized)
-        revision_id = str(uuid.uuid4())
+        number = session.scalar(select(func.max(ScriptRevision.revision)).where(ScriptRevision.chapter_id == chapter.id)) or 0
+        revision = ScriptRevision(id=str(uuid.uuid4()), chapter_id=chapter.id, kind=kind, revision=number + 1,
+                                  content_hash=_hash_json(normalized), input_hash=input_hash)
+        revision.entries = [ScriptEntry(position=index, **row) for index, row in enumerate(normalized, 1)]
+        session.add(revision)
+        chapter.active_revision_id = revision.id
+        chapter.status = "reviewed" if kind in ("reviewed", "manual") else "generated"
+        session.execute(update(Artifact).where(Artifact.chapter_id == chapter.id, Artifact.status == "active").values(status="stale"))
+        session.execute(update(Artifact).where(Artifact.project_id == chapter.project_id, Artifact.chapter_id.is_(None), Artifact.status == "active").values(status="stale"))
+        session.execute(update(AudioSegment).where(AudioSegment.chapter_id == chapter.id).values(status="stale"))
+        session.flush()
+        return self._revision_dict(revision)
+
+    def save_revision(self, chapter_id: int, kind: str, entries: list[dict[str, str]], input_hash: str | None = None) -> dict[str, Any]:
         with self.db.session() as session, session.begin():
+            # Reserve the SQLite writer before reading the revision number.
+            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
             chapter = session.get(Chapter, chapter_id)
             if chapter is None:
                 raise KeyError(chapter_id)
-            number = session.scalar(select(func.max(ScriptRevision.revision)).where(ScriptRevision.chapter_id == chapter_id)) or 0
-            revision = ScriptRevision(id=revision_id, chapter_id=chapter_id, kind=kind, revision=number + 1, content_hash=content_hash, input_hash=input_hash)
-            revision.entries = [ScriptEntry(position=index, **row) for index, row in enumerate(normalized, 1)]
-            session.add(revision)
-            chapter.active_revision_id = revision_id
-            chapter.status = "reviewed" if kind in ("reviewed", "manual") else "generated"
-            session.execute(update(Artifact).where(Artifact.chapter_id == chapter_id, Artifact.status == "active").values(status="stale"))
-            session.execute(update(Artifact).where(Artifact.project_id == chapter.project_id, Artifact.chapter_id.is_(None), Artifact.status == "active").values(status="stale"))
-            session.execute(update(AudioSegment).where(AudioSegment.chapter_id == chapter_id).values(status="stale"))
-        return self.get_script(chapter_id)
+            return self._save_revision(session, chapter, kind, entries, input_hash)
 
     def latest_revision(self, chapter_id: int, kind: str) -> dict[str, Any] | None:
         with self.db.session() as session:
@@ -414,24 +424,27 @@ class Repository:
             )
             return self._revision_dict(revision) if revision else None
 
-    def edit_script(self, chapter_id: int, expected_revision: int, entries: list[dict[str, str]]) -> dict[str, Any]:
-        with self.db.session() as session:
-            chapter = session.get(Chapter, chapter_id)
-            if chapter is None:
-                raise KeyError(chapter_id)
-            active = session.get(ScriptRevision, chapter.active_revision_id) if chapter.active_revision_id else None
-            if active is None or active.revision != expected_revision:
-                raise RuntimeError("revision_conflict")
-            latest_job = self._latest_job(session, chapter.project_id)
-            if latest_job is None or latest_job.status not in EDITABLE_JOB_STATES:
-                raise RuntimeError("script_not_editable")
-        project_id = chapter.project_id
-        result = self.save_revision(chapter_id, "manual", entries)
-        with self.db.session() as session, session.begin():
-            project = session.get(Project, project_id)
-            project.status = "ready_for_tts"
-            project.updated_at = utcnow()
+    def _edit_script(self, session, chapter_id: int, expected_revision: int, entries: list[dict[str, str]]) -> dict[str, Any]:
+        chapter = session.get(Chapter, chapter_id)
+        if chapter is None:
+            raise KeyError(chapter_id)
+        active = session.get(ScriptRevision, chapter.active_revision_id) if chapter.active_revision_id else None
+        if active is None or active.revision != expected_revision:
+            raise RuntimeError("revision_conflict")
+        latest_job = self._latest_job(session, chapter.project_id)
+        active_job = session.scalar(select(Job.id).where(Job.project_id == chapter.project_id, Job.status.in_(ACTIVE_JOB_STATES)).limit(1))
+        if active_job or latest_job is None or latest_job.status not in EDITABLE_JOB_STATES:
+            raise RuntimeError("script_not_editable")
+        result = self._save_revision(session, chapter, "manual", entries)
+        project = session.get(Project, chapter.project_id)
+        project.status = "ready_for_tts"
+        project.updated_at = utcnow()
         return result
+
+    def edit_script(self, chapter_id: int, expected_revision: int, entries: list[dict[str, str]]) -> dict[str, Any]:
+        with self.db.session() as session, session.begin():
+            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            return self._edit_script(session, chapter_id, expected_revision, entries)
 
     def create_job(self, project_id: str, job_type: str = "preprocess", payload: dict[str, Any] | None = None) -> dict[str, Any]:
         with self._job_lock:

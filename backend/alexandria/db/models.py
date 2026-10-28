@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -13,6 +13,37 @@ def utcnow() -> datetime:
 
 class Base(DeclarativeBase):
     pass
+
+
+class AgentRun(Base):
+    __tablename__ = "agent_runs"
+    __table_args__ = (
+        UniqueConstraint("project_id", "request_id"),
+        Index("ix_agent_one_running", "project_id", unique=True, sqlite_where=text("status = 'running'")),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    request_id: Mapped[str] = mapped_column(String(36))
+    message: Mapped[str] = mapped_column(Text)
+    selected_chapter_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    allow_text_rewrite: Mapped[bool] = mapped_column(Boolean, default=False)
+    status: Mapped[str] = mapped_column(String(20), default="running")
+    output: Mapped[str] = mapped_column(Text, default="")
+    history_json: Mapped[str] = mapped_column(Text, default="[]")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AgentAction(Base):
+    __tablename__ = "agent_actions"
+    __table_args__ = (UniqueConstraint("run_id"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("agent_runs.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(20))
+    status: Mapped[str] = mapped_column(String(20))
+    args_json: Mapped[str] = mapped_column(Text)
+    result_json: Mapped[str] = mapped_column(Text, default="{}")
 
 
 class Project(Base):

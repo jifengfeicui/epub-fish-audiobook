@@ -4,6 +4,8 @@
 
 > 新默认入口是 Fish Audio 整书工作流：FastAPI + SQLite 后端与 Vue 3 前端。导入 EPUB 后可选择“每 N 章 Review 后开始渲染”（默认 3 章）或等待整本 Review 完成。旧 Qwen TTS、音色设计、LoRA 与数据集代码仍保留，但不挂载到新入口。
 
+项目页面新增 **Agent 助手**：用自然语言查询和控制任务、生成配音脚本修改提案，确认后保存。基于 Pydantic AI，复用当前 LLM 配置；模型需支持工具调用。[使用说明与验证](docs/agent.md)。
+
 开发启动：先运行 `pip install -r backend/requirements.txt` 与 `npm --prefix frontend install`，再分别运行 `python -m backend.alexandria.main` 和 `npm --prefix frontend run dev`。生产构建运行 `npm --prefix frontend run build` 后，由 FastAPI 在 `http://127.0.0.1:4200` 提供界面。
 
 CLI 使用相同默认值：`python tools/render_book.py --epub book.epub --render-start after-review-batch --release-batch-size 3`。如需兼容原先等待全书 Review 完成的行为，使用 `--render-start after-all-reviews`。

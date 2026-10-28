@@ -8,7 +8,7 @@ import aiofiles
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 
-from backend.alexandria.api.schemas import BilibiliJobCreate, BilibiliReconcile, ChapterListUpdate, CharacterListUpdate, JobCreate, ProjectUpdate, ProjectVoicePoolUpdate, ScriptUpdate, SettingsUpdate, VoiceListUpdate, VoiceValidationInput
+from backend.alexandria.api.schemas import AgentMessage, AgentDecision, BilibiliJobCreate, BilibiliReconcile, ChapterListUpdate, CharacterListUpdate, JobCreate, ProjectUpdate, ProjectVoicePoolUpdate, ScriptUpdate, SettingsUpdate, VoiceListUpdate, VoiceValidationInput
 from backend.alexandria.db.repository import Repository
 from backend.alexandria.domain.pipeline import RENDER_START_MODES
 
@@ -24,6 +24,11 @@ def _http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, KeyError):
         return HTTPException(status_code=404, detail="Resource not found")
     mapping = {
+        "agent_busy": (409, "当前项目 Agent 正在处理，请等待完成"),
+        "agent_request_conflict": (409, "请求编号已用于另一条消息，请重新发送"),
+        "agent_proposal_closed": (409, "提案已处理或过期，请重新读取脚本后生成提案"),
+        "agent_interrupted": (409, "Agent 已中断，请检查已执行的操作"),
+        "agent_one_action": (409, "每轮只允许一个写操作，请另发一条明确指令"),
         "active_job": (409, "另一个任务正在运行"),
         "invalid_llm_profiles": (422, "LLM 配置无效：请检查名称、HTTP(S) 服务地址、模型、唯一 ID 和当前选择"),
         "invalid_llm_api_key": (422, "新 LLM 配置不能使用密钥掩码，请输入 API Key 或留空"),
@@ -78,6 +83,38 @@ def _http_error(exc: Exception) -> HTTPException:
 @router.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@router.get("/projects/{project_id}/agent")
+def agent_conversation(project_id: str, request: Request):
+    try:
+        return request.app.state.agent.store.conversation(project_id)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/projects/{project_id}/agent/messages", status_code=202)
+async def agent_message(project_id: str, payload: AgentMessage, request: Request):
+    try:
+        return request.app.state.agent.submit(project_id, payload)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/projects/{project_id}/agent/runs/{run_id}")
+def agent_run(project_id: str, run_id: str, request: Request):
+    try:
+        return request.app.state.agent.store.get(project_id, run_id)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/projects/{project_id}/agent/proposals/{proposal_id}")
+def agent_decision(project_id: str, proposal_id: str, payload: AgentDecision, request: Request):
+    try:
+        return request.app.state.agent.store.decide(project_id, proposal_id, payload.approve)
+    except Exception as exc:
+        raise _http_error(exc) from exc
 
 
 @router.get("/projects")

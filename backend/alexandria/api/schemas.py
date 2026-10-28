@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Annotated, Any, Literal, Optional, Union
+from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -52,6 +53,24 @@ class ScriptEntryInput(BaseModel):
 class ScriptUpdate(BaseModel):
     expected_revision: int
     entries: list[ScriptEntryInput] = Field(min_length=1)
+
+
+class AgentMessage(BaseModel):
+    request_id: UUID
+    message: str = Field(min_length=1, max_length=8000)
+    selected_chapter_id: Optional[int] = Field(default=None, ge=1)
+    allow_text_rewrite: bool = False
+
+    @field_validator("message")
+    @classmethod
+    def strip_message(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("请输入指令")
+        return value.strip()
+
+
+class AgentDecision(BaseModel):
+    approve: bool
 
 
 class JobCreate(BaseModel):

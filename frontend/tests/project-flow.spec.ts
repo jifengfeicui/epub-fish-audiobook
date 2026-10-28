@@ -205,6 +205,8 @@ test('refreshes a replaced script while retaining edits when its revision is unc
   await nav.getByRole('button', { name: /日志/ }).click()
   await page.getByRole('button', { name: '刷新', exact: true }).click()
   await nav.getByRole('button', { name: '章节 1', exact: true }).click()
+  await expect(page.getByRole('textbox', { name: '文本', exact: true })).toHaveValue('未保存的修改')
+  await page.getByRole('button', { name: '放弃人工编辑' }).click()
   await expect(page.getByRole('textbox', { name: '文本', exact: true })).toHaveValue('重新生成的脚本')
   expect(scriptReads).toBe(2)
 })

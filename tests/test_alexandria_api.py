@@ -39,6 +39,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.client.put("/api/v1/settings", json={"fish_workers": 17}).status_code, 422)
 
     def test_voice_pool_endpoint_and_enabled_voice_shape(self):
+        self.client.app.state.repository.replace_voices([{"reference_id": "fixture-voice", "name": "测试音色"}])
         voices = self.client.get("/api/v1/voices")
         self.assertEqual(voices.status_code, 200)
         self.assertIn("enabled", voices.json()[0])

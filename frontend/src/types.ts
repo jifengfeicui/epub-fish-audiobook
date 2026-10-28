@@ -78,6 +78,24 @@ export interface Script {
   entries: ScriptEntry[]
 }
 
+export interface AgentAction {
+  id: string
+  kind: 'task' | 'control' | 'script'
+  status: string
+  args: { chapter_id?: number; expected_revision?: number; summary?: string; before?: ScriptEntry[]; entries?: ScriptEntry[]; text_changed?: boolean }
+  result: { id?: string; chapter_id?: number; revision?: number; message?: string }
+}
+
+export interface AgentRun {
+  id: string
+  request_id: string
+  message: string
+  status: 'running' | 'completed' | 'failed' | 'interrupted'
+  output: string
+  created_at: string
+  action: AgentAction | null
+}
+
 export interface JobEvent {
   event_id: number
   job_id: string

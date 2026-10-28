@@ -3,7 +3,7 @@ uvicorn==0.40.0
 pydantic==2.12.5
 pydub==0.25.1
 requests==2.33.0
-openai==2.16.0
+openai==3.31.0
 gradio_client==2.0.3
 soundfile==0.13.1
 numpy==2.2.6

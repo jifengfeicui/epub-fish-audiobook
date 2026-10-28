@@ -21,6 +21,7 @@ from backend.alexandria.scheduler.manager import Scheduler
 from backend.alexandria.scheduler.runner import PipelineRunner
 from backend.alexandria.services.stages import StageExecutor
 from backend.alexandria.services.bilibili import BilibiliService
+from backend.alexandria.services.agent import ProjectAgent
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -101,6 +102,7 @@ def create_app(data_dir: Path | None = None, *, start_scheduler: bool = True) ->
         bilibili = BilibiliService(repository)
         runner = PipelineRunner(repository, executor, broker, bilibili)
         scheduler = Scheduler(repository, runner)
+        agent = ProjectAgent(repository)
     except Exception:
         database.close()
         raise
@@ -113,6 +115,7 @@ def create_app(data_dir: Path | None = None, *, start_scheduler: bool = True) ->
         try:
             yield
         finally:
+            await agent.close()
             scheduler.stop()
             database.close()
 
@@ -122,6 +125,7 @@ def create_app(data_dir: Path | None = None, *, start_scheduler: bool = True) ->
     application.state.broker = broker
     application.state.scheduler = scheduler
     application.state.bilibili = bilibili
+    application.state.agent = agent
     application.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
