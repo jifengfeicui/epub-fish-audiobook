@@ -3,6 +3,11 @@
 import re
 from dataclasses import dataclass
 
+try:
+    from .script_segments import spoken_source
+except ImportError:
+    from script_segments import spoken_source
+
 
 # Script entries store spoken text without the source's outer dialogue marks.
 _IGNORED_QUOTE_MARKS = frozenset('"“”‘’「」『』')
@@ -35,8 +40,8 @@ def combined_script_text(entries):
     return "".join(str(entry.get("text", "")) for entry in entries)
 
 
-def compare_text_fidelity(source_text, entries, excerpt_radius=24):
-    source = normalize_fidelity_text(source_text)
+def compare_text_fidelity(source_text, entries, excerpt_radius=24, *, source_is_spoken=False):
+    source = normalize_fidelity_text(source_text if source_is_spoken else spoken_source(source_text))
     script = normalize_fidelity_text(combined_script_text(entries))
 
     mismatch = None

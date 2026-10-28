@@ -130,6 +130,7 @@ class StageExecutor:
             "generate_script": self._file_hash(self.root / "app" / "generate_script.py"),
             "llm_json": self._file_hash(self.root / "app" / "llm_json.py"),
             "script_validation": self._file_hash(self.root / "app" / "script_validation.py"),
+            "script_segments": self._file_hash(self.root / "app" / "script_segments.py"),
             "default_prompts": self._file_hash(self.root / "default_prompts.txt"),
         })
 
@@ -151,6 +152,7 @@ class StageExecutor:
             "review_script": self._file_hash(self.root / "app" / "review_script.py"),
             "llm_json": self._file_hash(self.root / "app" / "llm_json.py"),
             "script_validation": self._file_hash(self.root / "app" / "script_validation.py"),
+            "script_segments": self._file_hash(self.root / "app" / "script_segments.py"),
             "default_prompts": self._file_hash(self.root / "review_prompts.txt"),
         })
 

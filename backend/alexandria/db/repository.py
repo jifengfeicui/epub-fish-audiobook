@@ -391,6 +391,22 @@ class Repository:
             {"speaker": row["speaker"].strip(), "text": row["text"], "instruct": row.get("instruct", "").strip()}
             for row in entries
         ]
+        previous = session.scalars(select(ScriptEntry).where(
+            ScriptEntry.revision_id == chapter.active_revision_id
+        ).order_by(ScriptEntry.position)).all() if chapter.active_revision_id else []
+        old_lines: dict[str, list[str]] = {}
+        new_lines: dict[str, list[str]] = {}
+        for entry in previous:
+            old_lines.setdefault(entry.speaker, []).append(entry.text)
+        for entry in normalized:
+            new_lines.setdefault(entry["speaker"], []).append(entry["text"])
+        affected = {speaker for speaker in old_lines.keys() | new_lines.keys()
+                    if old_lines.get(speaker) != new_lines.get(speaker)} - {"NARRATOR"}
+        if affected:
+            session.execute(update(SpeakerAssignment).where(
+                SpeakerAssignment.project_id == chapter.project_id,
+                SpeakerAssignment.speaker.in_(affected), SpeakerAssignment.user_edited.is_(False),
+            ).values(gender="", personality=""))
         number = session.scalar(select(func.max(ScriptRevision.revision)).where(ScriptRevision.chapter_id == chapter.id)) or 0
         revision = ScriptRevision(id=str(uuid.uuid4()), chapter_id=chapter.id, kind=kind, revision=number + 1,
                                   content_hash=_hash_json(normalized), input_hash=input_hash)
@@ -810,6 +826,21 @@ class Repository:
 
     def seed_settings(self, defaults: dict[str, Any]) -> None:
         with self.db.session() as session, session.begin():
+            # Upgrade only untouched legacy defaults; custom prompt fields stay intact.
+            prompt_row = session.get(AppSetting, "prompts")
+            legacy_hashes = {
+                'system_prompt': '375672fce751db997f0fe4dfcf63dbe317dfb4774542c1d5d06150599e7b588b',
+                'user_prompt': 'a2e49ea3005c1b63dd6f9e248ddfaf8ce0a34aed1ed8bf29a7723f4398d13317',
+                'review_system_prompt': '6209c637c50a5f16ff8bef6e5d19543599a38278ac84d6809feb31d3335341a6',
+                'review_user_prompt': '40982def3635dc244998cccf85f3a74afe7f421e93deaac6cb971b35c8991459',
+            }
+            if prompt_row is not None:
+                prompts = json.loads(prompt_row.value_json)
+                for key, fingerprint in legacy_hashes.items():
+                    value = prompts.get(key, "").replace("\r\n", "\n").strip()
+                    if key in defaults.get("prompts", {}) and hashlib.sha256(value.encode("utf-8")).hexdigest() == fingerprint:
+                        prompts[key] = defaults["prompts"][key]
+                prompt_row.value_json = json.dumps(prompts, ensure_ascii=False)
             for key, value in defaults.items():
                 if session.get(AppSetting, key) is None:
                     session.add(AppSetting(key=key, value_json=json.dumps(value, ensure_ascii=False), is_secret=key in SECRET_KEYS))

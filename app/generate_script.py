@@ -6,6 +6,7 @@ import argparse
 from openai import OpenAI
 from llm_json import create_json_completion
 from default_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
+from script_segments import split_annotation_segments, annotation_batches
 from script_validation import (
     compare_text_fidelity,
     format_fidelity_error,
@@ -19,69 +20,9 @@ from script_validation import (
 SINGLE_SPEAKER_MAX_CHARS = 500
 
 
-def split_annotation_segments(text):
-    """Split text for speaker annotation while keeping every character immutable."""
-    pairs = {"“": "”", "「": "」", "『": "』", '"': '"'}
-    endings = set("。！？!?；;\n")
-    segments = []
-    buffer = ""
-    quote_end = None
-    for char in text:
-        if quote_end is None and char in pairs:
-            if buffer:
-                segments.append(buffer)
-                buffer = ""
-            quote_end = pairs[char]
-        buffer += char
-        if quote_end is not None and char == quote_end and len(buffer) > 1:
-            segments.append(buffer)
-            buffer = ""
-            quote_end = None
-        elif quote_end is None and char in endings:
-            segments.append(buffer)
-            buffer = ""
-    if buffer:
-        segments.append(buffer)
-    compact = []
-    pending = ""
-    for segment in segments:
-        if segment.strip():
-            compact.append(pending + segment)
-            pending = ""
-        else:
-            pending += segment
-    if pending and compact:
-        compact[-1] += pending
-    return [
-        {"segment_id": f"s{index:04d}", "text": segment}
-        for index, segment in enumerate(compact, 1)
-        if segment.strip()
-    ]
-
-
 def split_annotation_chunks(text, max_size, max_segments=30):
-    chunks = []
-    current = ""
-    current_segments = 0
-    for segment in split_annotation_segments(text):
-        value = segment["text"]
-        if current and (len(current) + len(value) > max_size or current_segments >= max_segments):
-            chunks.append(current)
-            current = ""
-            current_segments = 0
-        while len(value) > max_size:
-            if current:
-                chunks.append(current)
-                current = ""
-                current_segments = 0
-            chunks.append(value[:max_size])
-            value = value[max_size:]
-        if value:
-            current += value
-            current_segments += 1
-    if current:
-        chunks.append(current)
-    return chunks
+    return ["".join(segment["text"] for segment in batch)
+            for batch in annotation_batches(split_annotation_segments(text), max_size, max_segments)]
 
 
 def annotations_to_entries(segments, annotations):
@@ -99,6 +40,8 @@ def annotations_to_entries(segments, annotations):
         instruct = annotation.get("instruct", "")
         if not isinstance(speaker, str) or not speaker.strip():
             raise ValueError(f"invalid speaker for {segment['segment_id']}")
+        if segment.get("expected_speaker") and speaker.strip() != segment["expected_speaker"]:
+            raise ValueError(f"{segment['segment_id']} must use explicit speaker {segment['expected_speaker']!r}")
         if not isinstance(instruct, str):
             raise ValueError(f"invalid instruct for {segment['segment_id']}")
         entries.append({"speaker": speaker.strip(), "text": segment["text"], "instruct": instruct.strip()})
@@ -115,12 +58,13 @@ def annotation_response_format(segments):
         if chinese_source else {"type": "string", "minLength": 1}
     )
 
-    def item(segment_id):
+    def item(segment):
         return {
             "type": "object",
             "properties": {
-                "segment_id": {"const": segment_id},
-                "speaker": speaker_schema,
+                "segment_id": {"const": segment["segment_id"]},
+                "speaker": ({"const": segment["expected_speaker"]}
+                            if segment.get("expected_speaker") else speaker_schema),
                 "instruct": {"type": "string"},
             },
             "required": ["segment_id", "speaker", "instruct"],
@@ -134,7 +78,7 @@ def annotation_response_format(segments):
             "strict": True,
             "schema": {
                 "type": "array",
-                "prefixItems": [item(segment["segment_id"]) for segment in segments],
+                "prefixItems": [item(segment) for segment in segments],
                 "minItems": len(segments),
                 "maxItems": len(segments),
             },
@@ -400,14 +344,16 @@ def split_into_chunks(text, max_size=3000):
 
     return chunks
 
-def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_entries=None, max_retries=2, system_prompt=None, user_prompt_template=None, max_tokens=4096, temperature=0.6, top_p=0.8, top_k=0, min_p=0, presence_penalty=0.0, banned_tokens=None, first_person_speaker=None):
+def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_entries=None, max_retries=2, system_prompt=None, user_prompt_template=None, max_tokens=4096, temperature=0.6, top_p=0.8, top_k=0, min_p=0, presence_penalty=0.0, banned_tokens=None, first_person_speaker=None, segments=None):
     """Process a text chunk and return JSON script entries"""
     # Use provided prompts or fall back to defaults
     sys_prompt = (system_prompt or DEFAULT_SYSTEM_PROMPT) + (
-        "\n\nHIGHEST PRIORITY OUTPUT CONTRACT: The input contains immutable numbered segments. "
-        "Return only segment_id, speaker, and instruct for every segment in order. Never return a text field. "
-        "Any earlier output examples containing text use an obsolete schema and must be ignored. "
-        "For Chinese source text, speaker labels must use the exact Chinese names or Chinese descriptive roles; never romanize or translate them."
+        "\n\n最高优先级协议：逐一按序返回全部不可变片段的 segment_id、speaker、instruct；"
+        "不返回正文，不拆分或合并。expected_speaker 必须逐字采用，speaker_hint 仅为语义提示。"
+        "中文角色使用准确中文姓名或身份。旧的正文输出示例不适用。"
+        "source_context 是原始发言上下文，仅供判断，不要输出。"
+        "角色的论证、举例、感慨即使没有引号或跨段，仍可能是在对对方说话；"
+        "只有真正的动作、场景或叙述才用旁白，不要因陈述句或换段改换角色。"
     )
     usr_template = user_prompt_template or DEFAULT_USER_PROMPT
 
@@ -443,14 +389,11 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
         )
 
     context = "\n".join(context_parts)
-    segments = split_annotation_segments(chunk)
+    segments = segments if segments is not None else split_annotation_segments(chunk)
     segment_json = json.dumps(segments, indent=2, ensure_ascii=False)
     user_prompt = usr_template.format(context=context, chunk=segment_json) + (
-        "\n\nMANDATORY OUTPUT PROTOCOL:\n"
-        "The source is an array of immutable segments. Return one JSON object for every segment, in the same order. "
-        "Each object must contain only segment_id, speaker, and instruct. Never return or rewrite text. "
-        "Use NARRATOR for narration and structural text. Preserve canonical character names.\n"
-        "The immutable segments are provided above in the configured source section."
+        "\n\n强制输出协议：每个片段仅返回 segment_id、speaker、instruct；ID 完整有序。"
+        "严格遵守 expected_speaker，不返回、改写、拆分或合并正文。"
     )
     retry_feedback = ""
 
@@ -538,7 +481,7 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
                 print(f"  Normalized {normalized_count} unsafe speaker label(s) to {first_person_speaker!r}")
             schema_errors = validate_script_entries(entries)
             schema_errors.extend(validate_speakers_for_source(entries, chunk))
-            fidelity = compare_text_fidelity(chunk, entries)
+            fidelity = compare_text_fidelity("".join(row["text"] for row in segments), entries, source_is_spoken=True)
             if not schema_errors and fidelity.exact:
                 if attempt > 0:
                     print(f"  Succeeded on retry {attempt + 1}")
@@ -708,14 +651,15 @@ def main():
     )
 
     # Split into chunks at natural boundaries
-    chunks = split_annotation_chunks(book_content, max_size=chunk_size)
+    chunks = annotation_batches(split_annotation_segments(book_content), max_size=chunk_size)
     total_chunks = len(chunks)
 
     print(f"Split into {total_chunks} chunks at paragraph/sentence boundaries")
 
     all_entries = []
     failed_chunks = []
-    for i, chunk in enumerate(chunks, 1):
+    for i, segments in enumerate(chunks, 1):
+        chunk = "".join(segment["text"] for segment in segments)
         print(f"Processing chunk {i}/{total_chunks} ({len(chunk)} chars)...")
 
         previous = all_entries if len(all_entries) > 0 else None
@@ -731,7 +675,7 @@ def main():
             min_p=min_p,
             presence_penalty=presence_penalty,
             banned_tokens=banned_tokens,
-            first_person_speaker=first_person_speaker
+            first_person_speaker=first_person_speaker, segments=segments
         )
         if not entries:
             failed_chunks.append(i)

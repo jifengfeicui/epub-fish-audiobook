@@ -294,13 +294,12 @@ class AdapterTests(unittest.TestCase):
 class PromptTests(unittest.TestCase):
     def test_prompt_files_keep_separator_and_chinese_rules(self):
         root = Path(__file__).resolve().parents[1]
-        for name, marker in (
-            ("default_prompts.txt", "CHINESE DIALOGUE AND NARRATION"),
-            ("review_prompts.txt", "CHINESE REVIEW EXAMPLE"),
-        ):
+        for name in ("default_prompts.txt", "review_prompts.txt"):
             content = (root / name).read_text(encoding="utf-8")
             self.assertEqual(content.count("---SEPARATOR---"), 1)
-            self.assertIn(marker, content)
+            for marker in ("segment_id", "expected_speaker", "speaker_hint", "NARRATOR", "青年", "哲人",
+                           "不改写、拆分或合并正文"):
+                self.assertIn(marker, content)
 
 
 if __name__ == "__main__":

@@ -7,11 +7,13 @@ from openai import OpenAI
 from llm_json import create_json_completion
 from review_prompts import REVIEW_SYSTEM_PROMPT, REVIEW_USER_PROMPT
 from generate_script import annotation_response_format, annotations_to_entries, clean_json_string, repair_json_array
+from script_segments import split_annotation_segments
 from script_validation import (
     combined_script_text,
     compare_text_fidelity,
     format_fidelity_error,
     normalize_unsafe_speakers,
+    normalize_fidelity_text,
     validate_speakers_for_source,
     validate_script_entries,
 )
@@ -82,17 +84,64 @@ def merge_consecutive_narrators(entries, max_merged_length=800):
     return merged, merges
 
 
+def review_source_segments(entries, source_text=None):
+    segments = [dict(segment_id=f"s{index:04d}", text=entry['text'],
+                     current_speaker=entry['speaker'], current_instruct=entry.get('instruct', ''))
+                for index, entry in enumerate(entries, 1)]
+    if source_text is None:
+        return segments
+    source = split_annotation_segments(source_text)
+    if normalize_fidelity_text(combined_script_text(source)) != normalize_fidelity_text(combined_script_text(entries)):
+        raise ValueError('Script does not match spoken source; rerun Generate before Review')
+    spans = []
+    end = 0
+    for row in source:
+        start = end
+        end += len(normalize_fidelity_text(row['text']))
+        spans.append((start, end, row))
+    position = 0
+    cursor = 0
+    for segment in segments:
+        end = position + len(normalize_fidelity_text(segment['text']))
+        while cursor < len(spans) and spans[cursor][1] <= position:
+            cursor += 1
+        overlapping = []
+        for start, stop, row in spans[cursor:]:
+            if start >= end:
+                break
+            if stop > position:
+                overlapping.append(row)
+        if len({row['turn_id'] for row in overlapping}) > 1:
+            raise ValueError('Script crosses explicit dialogue turns; rerun Generate before Review')
+        expected = {row['expected_speaker'] for row in overlapping if row.get('expected_speaker')}
+        if len(expected) > 1:
+            raise ValueError('Script mixes explicit speakers; rerun Generate before Review')
+        if expected:
+            segment['expected_speaker'] = expected.pop()
+        if overlapping:
+            row = overlapping[0]
+            segment['speaker_hint'] = row.get('speaker_hint')
+            segment['turn_id'] = row['turn_id']
+            segment['paragraph_id'] = row['paragraph_id']
+            segment['source_context'] = row['source_context']
+        position = end
+    return segments
+
+
 def review_batch(client, model_name, batch_entries, batch_num, total_batches,
                  previous_tail=None, source_context=None, max_retries=2,
                  system_prompt=None, user_prompt_template=None,
                  max_tokens=8000, temperature=0.4, top_p=0.8, top_k=20,
-                 min_p=0, presence_penalty=0.0, banned_tokens=None):
+                 min_p=0, presence_penalty=0.0, banned_tokens=None, source_segments=None,
+                 first_person_speaker=None, recheck_narrators=True):
     """Send a batch of script entries through the LLM for review and correction."""
     sys_prompt = (system_prompt or REVIEW_SYSTEM_PROMPT) + (
-        "\n\nHIGHEST PRIORITY OUTPUT CONTRACT: Correct metadata only. Return only segment_id, speaker, "
-        "and instruct for every immutable segment in order. Never return text or merge/split segments. "
-        "Any earlier output examples containing text use an obsolete schema and must be ignored. "
-        "For Chinese source text, speaker labels must use the exact Chinese names or Chinese descriptive roles; never romanize or translate them."
+        "\n\n最高优先级协议：仅修正角色与语气，逐一按序返回 segment_id、speaker、instruct。"
+        "不返回正文，不拆分或合并。expected_speaker 必须逐字采用，不能被 current_speaker 覆盖；"
+        "speaker_hint 仅为语义提示。中文角色保留准确中文姓名或身份。旧的正文输出示例不适用。"
+        "source_context 是原始发言上下文，仅供判断，不要输出。"
+        "角色的论证、举例、感慨即使没有引号或跨段，仍可能是在对对方说话；"
+        "只有真正的动作、场景或叙述才用旁白，不要因陈述句或换段改换角色。"
     )
     usr_template = user_prompt_template or REVIEW_USER_PROMPT
 
@@ -108,22 +157,15 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
     # Optional extra context (e.g. source snippet or surrounding entries)
     if source_context:
         context_parts.append(f"\nADDITIONAL REVIEW CONTEXT:\n{source_context}")
+    if first_person_speaker:
+        context_parts.append(f"已配置的持续第一人称叙述者：{first_person_speaker}。保持此身份，但原文明示角色优先。")
 
     context = "\n".join(context_parts)
-    segments = [
-        {
-            "segment_id": f"s{index:04d}",
-            "text": entry["text"],
-            "current_speaker": entry["speaker"],
-            "current_instruct": entry.get("instruct", ""),
-        }
-        for index, entry in enumerate(batch_entries, 1)
-    ]
+    segments = source_segments if source_segments is not None else review_source_segments(batch_entries)
     batch_json = json.dumps(segments, indent=2, ensure_ascii=False)
     user_prompt = usr_template.format(context=context, batch=batch_json) + (
-        "\n\nMANDATORY OUTPUT PROTOCOL:\n"
-        "Return one JSON object for every immutable segment, in the same order. Each object must contain only "
-        "segment_id, speaker, and instruct. Correct metadata only; never return, merge, split, or rewrite text."
+        "\n\n强制输出协议：每个片段仅返回 segment_id、speaker、instruct；ID 完整有序。"
+        "严格遵守 expected_speaker，不返回、改写、拆分或合并正文。"
     )
 
     for attempt in range(max_retries + 1):
@@ -203,6 +245,27 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
                     user_prompt += f"\n\nVALIDATION FEEDBACK: {exc}"
                     continue
                 return None
+            suspect_indices = [index for index, (segment, entry) in enumerate(zip(segments, entries))
+                               if recheck_narrators and segment.get('speaker_hint')
+                               and not segment.get('expected_speaker') and entry['speaker'] == 'NARRATOR']
+            if suspect_indices:
+                checked = review_batch(
+                    client, model_name, [entries[index] for index in suspect_indices], batch_num, total_batches,
+                    source_context=source_context, max_retries=max_retries,
+                    system_prompt=sys_prompt + "\n复核任务：这些片段有角色续说线索，却被判为旁白。"
+                    "请通读 source_context 中的原始发言，独立判断是角色跨段续说，还是实际动作/场景叙述。"
+                    "不能把角色说出的概括性论述当成叙述者的说明，也不能把真实动作强行归给角色。",
+                    user_prompt_template=usr_template, max_tokens=max_tokens, temperature=temperature,
+                    top_p=top_p, top_k=top_k, min_p=min_p, presence_penalty=presence_penalty,
+                    banned_tokens=banned_tokens, first_person_speaker=first_person_speaker,
+                    source_segments=[dict(segments[index], current_speaker=entries[index]['speaker'],
+                                          current_instruct=entries[index]['instruct']) for index in suspect_indices],
+                    recheck_narrators=False,
+                )
+                if checked is None:
+                    return None
+                for index, entry in zip(suspect_indices, checked):
+                    entries[index] = entry
             if attempt > 0:
                 print(f"  Succeeded on retry {attempt + 1}")
             return entries
@@ -228,7 +291,7 @@ def check_text_loss(original_entries, corrected_entries, threshold=0.95, upper_b
     del threshold, upper_bound
     original_text = combined_script_text(original_entries)
     corrected_text = combined_script_text(corrected_entries)
-    result = compare_text_fidelity(original_text, corrected_entries)
+    result = compare_text_fidelity(original_text, corrected_entries, source_is_spoken=True)
     ratio = result.script_length / result.source_length if result.source_length else 1.0
     return result.exact, original_text, corrected_text, ratio
 
@@ -341,6 +404,12 @@ def main():
     if first_person_speaker:
         print(f"First-person narrator identity: {first_person_speaker}")
 
+    try:
+        source_segments = review_source_segments(entries, source_text)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        sys.exit(1)
+
     client = OpenAI(base_url=base_url, api_key=api_key)
 
     all_corrected = []
@@ -391,7 +460,8 @@ def main():
                 top_k=top_k,
                 min_p=min_p,
                 presence_penalty=presence_penalty,
-                banned_tokens=banned_tokens
+                banned_tokens=banned_tokens,
+                source_segments=source_segments[start:end], first_person_speaker=first_person_speaker
             )
 
             if corrected is None:
@@ -455,12 +525,14 @@ def main():
         previous_tail = None
 
         for i, batch in enumerate(batches, 1):
+            start = (i - 1) * batch_size
+            end = start + len(batch)
             print(f"\nReviewing batch {i}/{total_batches} ({len(batch)} entries)...")
 
             corrected = review_batch(
                 client, model_name, batch, i, total_batches,
                 previous_tail=previous_tail,
-                source_context=None,  # Mode 2: would pass source text chunk here
+                source_context="使用每个片段的 source_context 和 expected_speaker 核对原文；当前标签可能有误。",
                 system_prompt=review_sys,
                 user_prompt_template=review_usr,
                 max_tokens=max_tokens,
@@ -469,7 +541,8 @@ def main():
                 top_k=top_k,
                 min_p=min_p,
                 presence_penalty=presence_penalty,
-                banned_tokens=banned_tokens
+                banned_tokens=banned_tokens,
+                source_segments=source_segments[start:end], first_person_speaker=first_person_speaker
             )
 
             if corrected is None:
@@ -527,7 +600,7 @@ def main():
     # Post-processing: merge consecutive NARRATOR entries with same instruct
     merge_narrators_enabled = generation_config.get("merge_narrators", False)
     narrator_merges = 0
-    if merge_narrators_enabled:
+    if merge_narrators_enabled and not source_text:
         pre_merge_count = len(all_corrected)
         all_corrected, narrator_merges = merge_consecutive_narrators(all_corrected, max_merged_length=800)
         if narrator_merges > 0:
@@ -548,7 +621,14 @@ def main():
             print(f"Error: Reviewed script does not cover the source: {format_fidelity_error(source_fidelity)}")
             print(f"Existing output was not changed: {output_path}")
             sys.exit(1)
-        print("Source fidelity: exact normalized character match")
+        try:
+            final_segments = review_source_segments(all_corrected, source_text)
+            annotations_to_entries(final_segments, [dict(segment_id=row["segment_id"], speaker=entry["speaker"], instruct=entry.get("instruct", ""))
+                                                   for row, entry in zip(final_segments, all_corrected)])
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
+        print("Source fidelity and explicit speaker boundaries: exact match")
 
     # Write corrected script
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
