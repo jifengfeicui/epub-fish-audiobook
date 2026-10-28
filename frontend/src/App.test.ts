@@ -9,7 +9,7 @@ describe('error toast', () => {
 
   it('can be closed and disappears after five seconds', async () => {
     vi.useFakeTimers()
-    const wrapper = mount(App, { global: { stubs: { RouterLink: { template: '<a><slot /></a>' }, RouterView: true } } })
+    const wrapper = mount(App, { global: { mocks: { $route: { path: '/' } }, stubs: { RouterLink: { template: '<a><slot /></a>' }, RouterView: true } } })
 
     notifyError('上传失败')
     await nextTick()

@@ -26,6 +26,16 @@
 .section-nav button.active { color: #214b36; background: white; box-shadow: 0 2px 7px rgba(31,61,43,.12); }
 .section-nav small { color: #91a198; font: 10px "DM Mono", monospace; }
 .section-content { min-width: 0; }
+.project-page .workspace-grid { height: var(--workspace-height, 440px); align-items: stretch; }
+.project-page .chapter-list, .project-page .script-panel { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.project-page .workspace-grid .panel-heading { flex: none; gap: 10px; flex-wrap: wrap; }
+.chapter-scroll, .project-page .entry-list { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior-y: contain; scrollbar-gutter: stable; }
+.chapter-scroll:focus-visible, .entry-list:focus-visible { outline: 2px solid #9dbca8; outline-offset: -2px; }
+@media (max-width: 760px) {
+  .project-page .workspace-grid { height: auto; }
+  .project-page .chapter-list { height: 230px; max-height: none; overflow: hidden; }
+  .project-page .script-panel { height: max(380px, calc(100dvh - 160px)); }
+}
 .chapter-list > .panel-heading small { color: #7d9185; font: 10px "DM Mono", monospace; }
 .chapter-save { min-height: 32px; padding: 7px 9px; }
 .chapter-item-row { position: relative; border-bottom: 1px solid #edf1ed; }

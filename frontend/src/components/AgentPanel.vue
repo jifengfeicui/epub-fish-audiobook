@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { ArrowUp, BookOpenText, Grip, MessageSquare, RefreshCw, Sparkles, X } from 'lucide-vue-next'
 import { api } from '../api/client'
 import type { AgentAction, AgentRun, Chapter, ScriptEntry } from '../types'
 
@@ -12,12 +13,81 @@ const sending = ref(false)
 const deciding = ref(false)
 const error = ref('')
 const loading = ref(true)
+const opened = ref(false)
+const launcher = ref<HTMLButtonElement | null>(null)
+const composer = ref<HTMLTextAreaElement | null>(null)
+const history = ref<HTMLElement | null>(null)
+const followLatest = ref(true)
+const bounds = ref({ x: 0, y: 0, width: 460, height: 640 })
+const windowStyle = computed(() => ({ left: `${bounds.value.x}px`, top: `${bounds.value.y}px`, width: `${bounds.value.width}px`, height: `${bounds.value.height}px` }))
+let initialized = false
+let gesture: { x: number; y: number; bounds: typeof bounds.value; resize: boolean } | undefined
 const busy = computed(() => runs.value.some(run => run.status === 'running'))
 const base = `/api/v1/projects/${props.projectId}/agent`
 let timer = 0
 let stopped = false
 let submission: { signature: string; id: string } | undefined
 const statusNames: Record<string, string> = { running: '处理中', completed: '本轮已处理', failed: '失败', interrupted: '已中断', pending: '待确认', applied: '已保存', rejected: '已拒绝', outdated: '已过期', executing: '正在提交' }
+
+function fitWindow() {
+  const b = bounds.value
+  b.width = Math.min(Math.max(360, b.width), window.innerWidth - 24)
+  b.height = Math.min(Math.max(360, b.height), window.innerHeight - 24)
+  b.x = Math.max(12, Math.min(b.x, window.innerWidth - b.width - 12))
+  b.y = Math.max(12, Math.min(b.y, window.innerHeight - b.height - 12))
+}
+
+async function toggle() {
+  opened.value = !opened.value
+  if (!opened.value) { launcher.value?.focus(); return }
+  if (!initialized) {
+    initialized = true
+    bounds.value.x = window.innerWidth - 484
+    bounds.value.y = window.innerHeight - 720
+    fitWindow()
+    void load()
+  }
+  await nextTick()
+  if (followLatest.value && history.value) history.value.scrollTop = history.value.scrollHeight
+  composer.value?.focus({ preventScroll: true })
+}
+
+function startGesture(event: PointerEvent, resize = false) {
+  if (event.button !== 0 || window.innerWidth <= 600 || (!resize && (event.target as HTMLElement).closest('button'))) return
+  gesture = { x: event.clientX, y: event.clientY, bounds: { ...bounds.value }, resize }
+  ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
+  event.preventDefault()
+}
+
+function moveGesture(event: PointerEvent) {
+  if (!gesture) return
+  const dx = event.clientX - gesture.x, dy = event.clientY - gesture.y
+  const b = gesture.bounds
+  bounds.value = gesture.resize ? { ...b, width: Math.min(b.width + dx, window.innerWidth - b.x - 12), height: Math.min(b.height + dy, window.innerHeight - b.y - 12) }
+    : { ...b, x: b.x + dx, y: b.y + dy }
+  fitWindow()
+}
+
+function adjustWithKeys(event: KeyboardEvent, resize = false) {
+  if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return
+  event.preventDefault()
+  const dx = event.key === 'ArrowLeft' ? -20 : event.key === 'ArrowRight' ? 20 : 0
+  const dy = event.key === 'ArrowUp' ? -20 : event.key === 'ArrowDown' ? 20 : 0
+  if (resize) { bounds.value.width += dx; bounds.value.height += dy }
+  else { bounds.value.x += dx; bounds.value.y += dy }
+  fitWindow()
+}
+
+function trackScroll() {
+  if (history.value) followLatest.value = history.value.scrollHeight - history.value.scrollTop - history.value.clientHeight < 48
+}
+
+function composeKey(event: KeyboardEvent) {
+  if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
+    event.preventDefault()
+    void send()
+  }
+}
 
 async function load() {
   window.clearTimeout(timer)
@@ -27,6 +97,8 @@ async function load() {
     const wasBusy = busy.value
     runs.value = result.runs
     error.value = ''
+    await nextTick()
+    if (opened.value && followLatest.value && history.value) history.value.scrollTop = history.value.scrollHeight
     if (wasBusy && !busy.value) emit('changed')
   } catch (reason) { error.value = (reason as Error).message }
   finally {
@@ -74,25 +146,27 @@ function differences(action: AgentAction) {
 function content(entry?: ScriptEntry) {
   return entry ? `${entry.speaker}\n${entry.text}\n语气：${entry.instruct || '无'}` : '（无条目）'
 }
-onMounted(load)
-onBeforeUnmount(() => { stopped = true; window.clearTimeout(timer) })
+onMounted(() => window.addEventListener('resize', fitWindow))
+onBeforeUnmount(() => { stopped = true; window.clearTimeout(timer); window.removeEventListener('resize', fitWindow) })
 </script>
 
 <template>
-  <section class="agent-panel panel" aria-label="项目 Agent">
-    <div class="panel-heading"><div><h2>项目 Agent</h2><span class="muted">任务直接提交 · 改稿预览后确认</span></div><button class="button secondary" :disabled="sending || deciding" @click="load">刷新对话</button></div>
-    <div class="agent-body">
-      <div v-if="dirty" class="agent-notice" role="alert">
-        章节有未保存的人工编辑，请先保存或放弃，再发送指令或应用提案。
-        <div class="heading-actions"><button class="button secondary" :disabled="saving || !editable" @click="emit('save')">保存人工编辑</button><button class="button secondary" :disabled="saving" @click="emit('discard')">放弃人工编辑</button></div>
-      </div>
-      <p v-if="loading" class="muted">正在读取对话…</p>
-      <p v-else-if="!runs.length" class="muted">例如：“查询任务进度”“预处理第 1 到 3 章”“把当前章旁白的语气改得沉稳”。</p>
-      <div class="agent-history" role="log" aria-label="Agent 对话记录" aria-live="polite">
+  <Teleport to="body">
+    <button ref="launcher" class="agent-launcher" :aria-expanded="opened" aria-controls="project-agent-window" aria-label="Agent 助手" @click="toggle">
+      <MessageSquare :size="19" /><span>Agent 助手</span><i v-if="busy" class="agent-live-dot" /><span v-else-if="runs.some(run => run.action?.status === 'pending')" class="pending-dot" />
+    </button>
+    <section v-show="opened" id="project-agent-window" class="agent-window" :style="windowStyle" role="dialog" aria-label="项目 Agent" @keydown.esc.stop="opened && toggle()">
+      <header class="agent-header" @pointerdown="startGesture($event)" @pointermove="moveGesture" @pointerup="gesture = undefined" @lostpointercapture="gesture = undefined">
+        <div class="agent-title" tabindex="0" aria-label="移动 Agent 窗口，使用方向键" @keydown="adjustWithKeys($event)"><span class="agent-symbol"><Sparkles :size="18" /></span><div><h2>Agent 助手</h2><small>{{ busy ? '正在处理你的请求' : '一起完成这本有声书' }}</small></div></div>
+        <div class="agent-header-actions"><button class="agent-icon" aria-label="刷新对话" :disabled="sending || deciding" @click="load"><RefreshCw :size="16" /></button><button class="agent-icon" aria-label="收起 Agent" @click="toggle"><X :size="19" /></button></div>
+      </header>
+      <div ref="history" class="agent-history" role="log" aria-label="Agent 对话记录" aria-live="polite" @scroll="trackScroll">
+        <p v-if="loading" class="agent-loading">正在读取对话…</p>
+        <div v-else-if="!runs.length" class="agent-welcome"><Sparkles :size="28" /><h3>想从哪里开始？</h3><p>查看进度、安排任务，或一起打磨当前章节。</p><div class="agent-suggestions"><button v-for="suggestion in ['查询任务进度', '把当前章旁白的语气改得沉稳']" :key="suggestion" @click="draft = suggestion; composer?.focus()">{{ suggestion }}<ArrowUp :size="14" /></button></div></div>
         <article v-for="run in runs" :key="run.id" class="agent-turn">
           <p class="agent-user">{{ run.message }}</p>
-          <span class="muted">{{ statusNames[run.status] || run.status }} · {{ new Date(run.created_at).toLocaleTimeString() }}</span>
-          <p class="agent-answer">{{ run.output || '正在处理，请稍候…' }}</p>
+          <div class="agent-answer-label"><Sparkles :size="14" /><span>Alexandria</span><small>{{ statusNames[run.status] || run.status }}</small></div>
+          <p class="agent-answer">{{ run.output || '正在思考并检查项目状态…' }}</p>
           <div v-if="run.action" class="agent-action">
             <template v-if="run.action.kind === 'script'">
               <strong>脚本修改提案 · {{ statusNames[run.action.status] || run.action.status }}</strong>
@@ -111,15 +185,24 @@ onBeforeUnmount(() => { stopped = true; window.clearTimeout(timer) })
         </article>
       </div>
       <form class="agent-compose" @submit.prevent="send">
-        <label><span>给 Agent 的指令</span><textarea v-model="draft" aria-label="给 Agent 的指令" maxlength="8000" rows="3" placeholder="输入自然语言指令…" :disabled="sending || busy" /></label>
-        <div class="agent-options"><span class="muted">当前章：{{ chapterTitle || '未选择' }}</span><label><input v-model="allowRewrite" type="checkbox" :disabled="sending || busy" />本条指令允许改写正文</label></div>
+        <div v-if="dirty" class="agent-notice" role="alert">章节有未保存的人工编辑，请先保存或放弃，再发送指令或应用提案。<div class="agent-notice-actions"><button type="button" :disabled="saving || !editable" @click="emit('save')">保存人工编辑</button><button type="button" :disabled="saving" @click="emit('discard')">放弃人工编辑</button></div></div>
+        <div class="agent-context"><BookOpenText :size="13" /><span>当前章：{{ chapterTitle || '未选择' }}</span></div>
+        <div class="agent-input-box"><textarea ref="composer" v-model="draft" aria-label="给 Agent 的指令" maxlength="8000" rows="2" placeholder="询问进度，或描述你想做的修改…" :disabled="sending || busy" @keydown="composeKey" /><div class="agent-input-footer"><label><input v-model="allowRewrite" type="checkbox" :disabled="sending || busy" />本条指令允许改写正文</label><button class="agent-send" :aria-label="busy ? 'Agent 处理中' : sending ? '提交中' : '发送指令'" :disabled="loading || dirty || sending || busy || !draft.trim()"><ArrowUp :size="19" /></button></div></div>
         <p v-if="error" role="alert" class="agent-error">{{ error }}</p>
-        <button class="button primary" :disabled="loading || dirty || sending || busy || !draft.trim()">{{ busy ? 'Agent 处理中…' : sending ? '提交中…' : '发送指令' }}</button>
+        <small class="agent-footnote">{{ busy ? '收起窗口后仍会继续处理' : 'Enter 发送 · Shift+Enter 换行 · 改稿确认后保存' }}</small>
       </form>
-    </div>
-  </section>
+      <button type="button" class="agent-resize" aria-label="调整 Agent 窗口大小，使用方向键" @pointerdown="startGesture($event, true)" @pointermove="moveGesture" @pointerup="gesture = undefined" @lostpointercapture="gesture = undefined" @keydown="adjustWithKeys($event, true)"><Grip :size="14" /></button>
+    </section>
+  </Teleport>
 </template>
 
 <style scoped>
-.agent-body { padding: 18px; }.agent-history { max-height: 65vh; overflow-y: auto; }.agent-turn { border-bottom: 1px solid #dce6df; padding: 12px 0 20px; }.agent-user { font-weight: 700; color: #294438; white-space: pre-wrap; }.agent-answer { white-space: pre-wrap; line-height: 1.7; }.agent-action { margin-top: 12px; padding: 14px; background: #f5f8f5; border: 1px solid #dce6df; border-radius: 6px; overflow-wrap: anywhere; }.agent-diff { margin: 12px 0; }.agent-diff-columns { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 12px; margin-top: 7px; }.agent-diff-columns > div { min-width: 0; padding: 10px; background: white; border: 1px solid #dce6df; border-radius: 4px; }pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.6; }.agent-compose { display: grid; gap: 12px; margin-top: 20px; }.agent-compose textarea { width: 100%; min-height: 90px; resize: vertical; padding: 12px; border: 1px solid #afc5b5; border-radius: 5px; font: inherit; }.agent-options { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; }.agent-options label { display: flex; align-items: center; gap: 7px; font-size: 12px; }.agent-notice { padding: 14px; background: #fff3dc; border: 1px solid #dec28c; border-radius: 5px; line-height: 1.7; }.agent-notice .heading-actions { margin-top: 10px; }.agent-error { color: #a04c4c; white-space: pre-wrap; }@media(max-width: 650px) { .agent-diff-columns { grid-template-columns: 1fr; }.agent-body { padding: 12px; } }
+.agent-launcher { position: fixed; right: 24px; bottom: 20px; z-index: 15; display: flex; align-items: center; gap: 9px; padding: 13px 18px; border: 1px solid #333; border-radius: 999px; background: #242424; color: white; font-size: 13px; font-weight: 600; box-shadow: 0 5px 20px #0002; }
+.agent-live-dot, .pending-dot { width: 7px; height: 7px; border-radius: 50%; background: #8bd8b2; }.pending-dot { background: #f0c56e; }
+.agent-window { position: fixed; z-index: 16; display: flex; flex-direction: column; background: #fff; color: #262626; border: 1px solid #dedede; border-radius: 18px; box-shadow: 0 18px 70px #0002, 0 2px 8px #0001; overflow: hidden; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; }
+.agent-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 17px 18px; border-bottom: 1px solid #eeeeee; cursor: grab; touch-action: none; user-select: none; flex: none; }.agent-header:active { cursor: grabbing; }.agent-title { display: flex; align-items: center; gap: 10px; min-width: 0; }.agent-symbol { display: grid; place-items: center; width: 36px; height: 36px; background: #f3f3f3; border-radius: 10px; }.agent-title h2 { font-size: 15px; margin: 0 0 3px; font-weight: 650; }.agent-title small { color: #848484; font-size: 11px; }.agent-header-actions { display: flex; gap: 4px; }.agent-icon { display: grid; place-items: center; width: 30px; height: 30px; border: 0; border-radius: 8px; background: transparent; color: #777; }.agent-icon:hover { background: #f4f4f4; color: #222; }
+.agent-history { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 20px; scrollbar-gutter: stable; }.agent-loading { font-size: 13px; color: #888; }.agent-welcome { display: flex; flex-direction: column; justify-content: center; align-items: flex-start; min-height: 220px; padding: 12px 4px; }.agent-welcome > svg { color: #555; }.agent-welcome h3 { font-size: 22px; letter-spacing: -.5px; margin: 18px 0 9px; font-weight: 600; }.agent-welcome p { color: #858585; font-size: 13px; line-height: 1.7; margin: 0; }.agent-suggestions { display: grid; gap: 8px; margin-top: 22px; width: 100%; }.agent-suggestions button { display: flex; align-items: center; justify-content: space-between; padding: 12px; background: white; border: 1px solid #e8e8e8; border-radius: 10px; color: #555; font-size: 12px; text-align: left; }.agent-suggestions button:hover { background: #fafafa; }
+.agent-turn { margin-bottom: 28px; font-size: 13px; }.agent-user { width: fit-content; max-width: 90%; margin: 0 0 20px auto; padding: 11px 15px; border-radius: 16px 16px 4px 16px; background: #f1f1f1; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.7; }.agent-answer-label { display: flex; align-items: center; gap: 7px; font-size: 11px; font-weight: 600; }.agent-answer-label small { margin-left: auto; color: #999; font-weight: 400; }.agent-answer { margin: 11px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.85; }.agent-action { margin-top: 14px; padding: 14px; background: #fcfcfc; border: 1px solid #e5e5e5; border-radius: 12px; overflow-wrap: anywhere; line-height: 1.7; }.agent-action strong { font-size: 12px; }.agent-action p { font-size: 12px; margin: 8px 0; }.agent-action .muted { color: #888; font-size: 11px; }.agent-diff { margin: 12px 0; }.agent-diff-columns { display: grid; gap: 8px; margin-top: 7px; }.agent-diff-columns > div { min-width: 0; padding: 10px; background: #fff; border: 1px solid #e9e9e9; border-radius: 8px; }.agent-diff-columns > div:last-child { background: #f3f9f5; border-color: #dcebe1; }.agent-diff small { color: #888; font-size: 10px; }pre { margin: 5px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.7; }.agent-action .heading-actions { gap: 7px; margin-top: 14px; }.agent-action .button { padding: 8px 11px; font-size: 11px; }.agent-action .button.primary { background: #292929; box-shadow: none; }.agent-action .button.secondary { background: #efefef; color: #555; }
+.agent-compose { flex: none; display: grid; gap: 9px; padding: 12px 18px 15px; border-top: 1px solid #f0f0f0; max-height: 55%; overflow-y: auto; overscroll-behavior: contain; }.agent-context { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #888; }.agent-context span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.agent-input-box { border: 1px solid #e5e5e5; background: #f7f7f7; border-radius: 14px; padding: 11px 12px 9px; }.agent-input-box:focus-within { border-color: #b5b5b5; }.agent-compose textarea { display: block; width: 100%; min-height: 48px; max-height: 140px; resize: vertical; border: 0; padding: 0; outline: 0; color: #333; background: transparent; font: inherit; font-size: 13px; line-height: 1.6; }.agent-compose textarea::placeholder { color: #aaa; }.agent-input-footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 7px; }.agent-input-footer label { display: flex; align-items: center; gap: 4px; color: #888; font-size: 10px; }.agent-input-footer input { accent-color: #333; }.agent-send { display: grid; place-items: center; width: 30px; height: 30px; flex: none; border: 0; border-radius: 50%; background: #242424; color: white; }.agent-send:disabled { background: #dfdfdf; color: #aaa; cursor: not-allowed; }.agent-footnote { text-align: center; color: #aaa; font-size: 10px; }.agent-notice { padding: 10px 12px; background: #fff9ed; border: 1px solid #f0e2c6; border-radius: 10px; font-size: 11px; line-height: 1.7; }.agent-notice-actions { display: flex; gap: 12px; margin-top: 6px; }.agent-notice-actions button { border: 0; padding: 0; background: transparent; color: #825f2b; font-size: 11px; text-decoration: underline; }.agent-error { margin: 0; color: #ad4343; font-size: 12px; white-space: pre-wrap; }.agent-resize { position: absolute; right: 2px; bottom: 2px; display: grid; place-items: center; width: 18px; height: 18px; padding: 0; border: 0; background: transparent; color: #aaa; cursor: nwse-resize; touch-action: none; }.agent-window :focus-visible:not(textarea), .agent-launcher:focus-visible { outline: 2px solid #767676; outline-offset: 2px; }
+@media (max-width: 600px) { .agent-window { inset: 12px !important; width: auto !important; height: auto !important; border-radius: 14px; }.agent-resize { display: none; }.agent-header { cursor: default; }.agent-history { padding: 16px; }.agent-launcher { right: 16px; bottom: 16px; }.agent-compose { padding: 12px 14px; } }
 </style>

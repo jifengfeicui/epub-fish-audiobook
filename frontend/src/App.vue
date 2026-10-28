@@ -41,6 +41,6 @@ onBeforeUnmount(() => {
         <router-link to="/settings"><Settings :size="17" />设置</router-link>
       </nav>
     </header>
-    <main><router-view /></main>
+    <main><router-view :key="$route.path" /></main>
   </div>
 </template>
