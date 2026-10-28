@@ -5,6 +5,7 @@ export interface Job {
   project_id: string
   type: 'preprocess' | 'render' | 'merge' | 'bilibili' | 'character_analysis'
   payload: Record<string, unknown>
+  progress?: { completed: number; total: number }
   status: JobStatus
   render_start_mode: 'after_review_batch' | 'after_all_reviews'
   release_batch_size: number

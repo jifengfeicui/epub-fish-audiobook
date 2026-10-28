@@ -54,8 +54,11 @@ class PipelineRunner:
                 self.repo.set_job_status(job_id, "paused")
             return
         self.repo.set_job_status(job_id, "completed")
+        if job["type"] in ("preprocess", "character_analysis"):
+            chapters = self.repo.list_included_chapters(project["id"])
+            ready = bool(chapters) and all(chapter["status"] in ("reviewed", "done") for chapter in chapters)
+            self.repo.set_project_status(project["id"], "ready_for_tts" if ready else "ready")
         if job["type"] == "preprocess":
-            self.repo.set_project_status(project["id"], "ready_for_tts")
             try:
                 self.repo.create_job(project["id"], "character_analysis")
             except RuntimeError as exc:
@@ -63,23 +66,37 @@ class PipelineRunner:
                     raise
 
     def _preprocess(self, job: dict[str, Any], project: dict[str, Any]) -> None:
-        for chapter_data in self.repo.list_included_chapters(project["id"]):
+        force = job["payload"].get("force_regenerate", False)
+        stages = self.repo.get_stage_runs(job["id"])
+
+        def completed_here(chapter_id: int, stage: str, revision: dict[str, Any], input_hash: str) -> bool:
+            previous = stages.get((chapter_id, stage), {})
+            return (previous.get("status") == "completed" and previous.get("input_hash") == input_hash
+                    and previous.get("output_hash") == revision["content_hash"])
+
+        for chapter_data in self.repo.list_job_chapters(job):
             if self.repo.is_stop_requested(job["id"]):
                 raise StageCancelled("Stage cancelled")
             chapter_id = chapter_data["id"]
             chapter = self.repo.get_chapter_record(chapter_id)
             script = self.repo.get_script(chapter_id)
             generated = self.repo.latest_revision(chapter_id, "generated")
+            generation_hash = self.executor.generate_input_hash(chapter_id, project)
+            generated_is_current = (
+                generated is not None and generated["input_hash"] == generation_hash
+                and (not force or completed_here(chapter_id, "generate", generated, generation_hash))
+            )
             reviewed_is_current = (
                 script["kind"] == "reviewed"
-                and generated is not None
+                and generated_is_current
                 and script["input_hash"] == self.executor.review_input_hash(generated, project)
+                and (not force or completed_here(chapter_id, "review", script, script["input_hash"]))
             )
-            if script["kind"] != "manual" and not reviewed_is_current:
-                generation_hash = self.executor.generate_input_hash(chapter_id, project)
-                if generated and generated["input_hash"] == generation_hash:
+            if (force or script["kind"] != "manual") and not reviewed_is_current:
+                if generated_is_current:
                     self._event(job, "chapter.generate_reused", {"chapter_id": chapter_id, "position": chapter.position})
                 else:
+                    self.repo.update_stage(job["id"], chapter_id, "review", "pending")
                     self.repo.update_stage(job["id"], chapter_id, "generate", "running", input_hash=generation_hash)
                     self.repo.update_chapter_status(chapter_id, "generating")
                     self._event(job, "chapter.generating", {"chapter_id": chapter_id, "position": chapter.position})
@@ -115,6 +132,9 @@ class PipelineRunner:
                         self.repo.update_chapter_status(chapter_id, "failed")
                     raise
                 self.repo.update_stage(job["id"], chapter_id, "review", "completed", output_hash=script["content_hash"])
+            else:
+                self.repo.update_stage(job["id"], chapter_id, "review", "completed",
+                                       input_hash=script.get("input_hash"), output_hash=script["content_hash"])
             self.repo.update_chapter_status(chapter_id, "reviewed")
             self._event(job, "chapter.reviewed", {"chapter_id": chapter_id, "position": chapter.position})
 

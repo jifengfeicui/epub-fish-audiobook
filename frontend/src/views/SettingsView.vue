@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { CircleCheck, KeyRound, LoaderCircle, MessageSquareText, Mic2, Play, Plus, Save, Server, SlidersHorizontal, Trash2, Tv, X } from 'lucide-vue-next'
 import QrcodeVue from 'qrcode.vue'
 import { api } from '../api/client'
@@ -20,10 +20,17 @@ interface VoiceProfile {
   validating?: boolean
 }
 
+interface LlmProfile {
+  id: string
+  name: string
+  base_url: string
+  api_key: string
+  model: string
+}
+
 interface AppSettings {
-  llm_base_url: string
-  llm_api_key: string
-  llm_model: string
+  llm_profiles: LlmProfile[]
+  active_llm_profile_id: string
   fish_base_url: string
   fish_api_key: string
   fish_model: string
@@ -43,13 +50,14 @@ interface AppSettings {
 }
 
 const form = ref<AppSettings>({
-  llm_base_url: '', llm_api_key: '', llm_model: '',
+  llm_profiles: [], active_llm_profile_id: '',
   fish_base_url: '', fish_api_key: '', fish_model: '',
   fish_workers: 5,
   generation: { chunk_size: 3000, max_tokens: 4096, review_batch_size: 25 },
   prompts: { system_prompt: '', user_prompt: '', review_system_prompt: '', review_user_prompt: '' },
   fish_tts: { format: 'mp3', sample_rate: 44100, mp3_bitrate: 128, temperature: 0.7, top_p: 0.7, latency: 'normal', condition_on_previous_chunks: true, timeout_seconds: 300 },
 })
+const currentLlmProfile = computed(() => form.value.llm_profiles.find(profile => profile.id === form.value.active_llm_profile_id))
 const voices = ref<VoiceProfile[]>([])
 const saved = ref(false)
 const error = ref('')
@@ -66,10 +74,11 @@ let loginTimer = 0
 
 onMounted(async () => {
   const [settings, profiles] = await Promise.all([
-    api.get<AppSettings>('/api/v1/settings'),
+    api.get<AppSettings & { llm_base_url: string; llm_api_key: string; llm_model: string }>('/api/v1/settings'),
     api.get<VoiceProfile[]>('/api/v1/voices'),
   ])
-  form.value = settings
+  const { llm_base_url, llm_api_key, llm_model, ...editableSettings } = settings
+  form.value = editableSettings
   voices.value = profiles.map(profile => {
     profile.enabled ??= true
     return profile
@@ -164,10 +173,27 @@ function playSample(voice: VoiceProfile) {
 
 onBeforeUnmount(() => { previewAudio?.pause(); window.clearTimeout(loginTimer) })
 
+function addLlmProfile() {
+  const profile = { id: crypto.randomUUID(), name: '新配置', base_url: '', api_key: '', model: '' }
+  form.value.llm_profiles.push(profile)
+  form.value.active_llm_profile_id = profile.id
+}
+
+function removeLlmProfile() {
+  if (!currentLlmProfile.value || form.value.llm_profiles.length <= 1) return
+  if (!window.confirm(`删除 LLM 配置“${currentLlmProfile.value.name}”？保存后生效。`)) return
+  form.value.llm_profiles = form.value.llm_profiles.filter(profile => profile.id !== form.value.active_llm_profile_id)
+  form.value.active_llm_profile_id = form.value.llm_profiles[0]!.id
+}
+
 async function save() {
   error.value = ''
+  saved.value = false
   try {
-    await api.put('/api/v1/settings', form.value)
+    const settings = await api.put<AppSettings>('/api/v1/settings', form.value)
+    form.value.llm_profiles = settings.llm_profiles
+    form.value.active_llm_profile_id = settings.active_llm_profile_id
+    form.value.fish_api_key = settings.fish_api_key
     voices.value = await api.put<VoiceProfile[]>('/api/v1/voices', {
       voices: voices.value.map((voice, index) => ({ ...voice, pool_order: index })),
     })
@@ -206,9 +232,18 @@ async function save() {
           </section>
           <section class="panel settings-card">
             <div class="panel-heading"><div><h2>LLM Generate / Review</h2><span class="muted">OpenAI 兼容接口</span></div><KeyRound :size="19" /></div>
-            <label>服务地址<input v-model="form.llm_base_url" /></label>
-            <label>API Key<input v-model="form.llm_api_key" type="password" placeholder="********" /></label>
-            <label>模型<input v-model="form.llm_model" /></label>
+            <label>当前配置<select v-model="form.active_llm_profile_id"><option v-for="profile in form.llm_profiles" :key="profile.id" :value="profile.id">{{ profile.name }}</option></select></label>
+            <div class="llm-profile-actions">
+              <button class="button secondary" @click="addLlmProfile"><Plus :size="15" />新增配置</button>
+              <button class="button secondary" :disabled="form.llm_profiles.length <= 1" @click="removeLlmProfile"><Trash2 :size="15" />删除配置</button>
+            </div>
+            <template v-if="currentLlmProfile">
+              <label>配置名称<input v-model="currentLlmProfile.name" /></label>
+              <label>服务地址<input v-model="currentLlmProfile.base_url" /></label>
+              <label>API Key<input v-model="currentLlmProfile.api_key" type="password" placeholder="********" /></label>
+              <label>模型<input v-model="currentLlmProfile.model" /></label>
+            </template>
+            <p class="muted">保存后应用于 Generate、Review、角色分析和 B 站文案生成。</p>
           </section>
         </div>
         <div v-else-if="activeSection === 'rendering'" class="settings-grid">
@@ -270,3 +305,8 @@ async function save() {
     </div>
   </section>
 </template>
+
+<style scoped>
+.llm-profile-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 20px 16px; }
+.settings-card > .muted { margin: 0 20px 16px; font-size: 12px; }
+</style>

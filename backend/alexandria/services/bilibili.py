@@ -19,6 +19,7 @@ from typing import Any, Callable
 
 import httpx
 
+from app.llm_json import create_json_completion
 from backend.alexandria.db.repository import Repository
 from backend.alexandria.services.stages import StageCancelled
 
@@ -139,7 +140,7 @@ class BilibiliService:
             timeout=90,
         )
         try:
-            response = client.chat.completions.create(
+            response = create_json_completion(client,
                 model=settings.get("llm_model", "local-model"),
                 messages=[
                     {

@@ -109,6 +109,8 @@ class BilibiliReconcile(BaseModel):
 
 
 class SettingsUpdate(BaseModel):
+    llm_profiles: Optional[list[dict[str, Any]]] = None
+    active_llm_profile_id: Optional[str] = None
     llm_base_url: Optional[str] = None
     llm_api_key: Optional[str] = None
     llm_model: Optional[str] = None

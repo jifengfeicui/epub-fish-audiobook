@@ -25,12 +25,15 @@ def _http_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=404, detail="Resource not found")
     mapping = {
         "active_job": (409, "另一个任务正在运行"),
+        "invalid_llm_profiles": (422, "LLM 配置无效：请检查名称、HTTP(S) 服务地址、模型、唯一 ID 和当前选择"),
+        "invalid_llm_api_key": (422, "新 LLM 配置不能使用密钥掩码，请输入 API Key 或留空"),
         "revision_conflict": (409, "The script changed; reload before saving"),
         "project_running": (409, "Pause the project before editing its script"),
         "script_not_editable": (409, "Scripts can only be edited while a job is paused or completed"),
         "not_running": (409, "The job is not running"),
         "not_resumable": (409, "The job cannot be resumed"),
         "invalid_chapter_range": (422, "The selected chapter range is invalid"),
+        "invalid_preprocess_options": (422, "force_regenerate 必须为布尔值"),
         "no_included_chapters": (422, "At least one chapter must remain included"),
         "invalid_chapter_ids": (422, "Included chapters must belong to this project"),
         "voice_in_use": (409, "This voice is assigned to a project and cannot be removed"),

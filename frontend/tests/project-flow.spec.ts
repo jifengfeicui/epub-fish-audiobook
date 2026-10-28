@@ -83,7 +83,130 @@ test('opens a project and keeps preprocessing separate from TTS', async ({ page 
   await expect(page.getByRole('heading', { name: '活动日志' })).toBeVisible()
   await page.getByRole('button', { name: '章节 1', exact: true }).click()
   await page.getByRole('button', { name: '开始预解析' }).click()
+  page.once('dialog', dialog => dialog.accept())
+  await page.getByRole('dialog').getByRole('button', { name: '开始预解析' }).click()
   await expect(page.getByRole('button', { name: '暂停' })).toBeVisible()
+})
+
+test('restarts a confirmed preprocessing range and shows progress for this task', async ({ page }, testInfo) => {
+  const chapters = [1, 2, 3, 4].map(position => ({ id: position, project_id: 'range-book', position, included_position: position, included: true, title: `第${position}章`, status: 'done', active_revision_id: `old-${position}` }))
+  let job: { id: string; type: string; status: string; payload: Record<string, unknown>; progress: { completed: number; total: number } } | null = null
+  const requests: Record<string, unknown>[] = []
+  await page.route('**/api/v1/**', async route => {
+    const path = new URL(route.request().url()).pathname
+    if (path === '/api/v1/projects/range-book/jobs' && route.request().method() === 'POST') {
+      const request = route.request().postDataJSON()
+      requests.push(request)
+      job = { id: 'new-preprocess', type: 'preprocess', status: 'queued', payload: { ...request.payload, chapter_ids: [2, 3] }, progress: { completed: 0, total: 2 } }
+      await route.fulfill({ status: 201, json: job })
+      return
+    }
+    const responses: Record<string, unknown> = {
+      '/api/v1/projects/range-book': { id: 'range-book', title: '范围重跑测试', source_filename: 'book.epub', status: job?.status || 'ready_for_tts', latest_job: job, settings: {}, chapter_count: 4 },
+      '/api/v1/projects/range-book/chapters': chapters,
+      '/api/v1/projects/range-book/voice-pool': { excluded_voice_ids: [], narrator_voice_profile_id: 'voice-1' },
+      '/api/v1/projects/range-book/bilibili': { continuous_audio_count: 4, prepared_count: 0, published_count: 0, appendable_count: 0, chapters: [], form: {}, publication: null },
+      '/api/v1/chapters/1/script': { chapter_id: 1, revision: 2, kind: 'manual', entries: [] },
+    }
+    await route.fulfill({ json: responses[path] ?? [] })
+  })
+  await page.goto('/projects/range-book')
+  await page.getByRole('button', { name: '重新预解析' }).click()
+  const dialog = page.getByRole('dialog')
+  await expect(page.getByRole('heading', { name: '本次预解析范围' })).toBeVisible()
+  await expect(page.getByLabel('从第几章')).toHaveValue('1')
+  await expect(page.getByLabel('到第几章')).toHaveValue('4')
+  await expect(dialog.getByText(/包含手动修改/)).toBeVisible()
+  await page.getByLabel('从第几章').fill('0')
+  await expect(dialog.getByRole('button', { name: '开始预解析' })).toBeDisabled()
+  await page.getByLabel('从第几章').fill('2.5')
+  await expect(dialog.getByRole('button', { name: '开始预解析' })).toBeDisabled()
+  await page.getByLabel('从第几章').fill('2')
+  await page.getByLabel('到第几章').fill('3')
+  await page.screenshot({ path: testInfo.outputPath('preprocess-range-desktop.png'), fullPage: true })
+  await page.setViewportSize({ width: 390, height: 844 })
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true)
+  await page.screenshot({ path: testInfo.outputPath('preprocess-range-mobile.png'), fullPage: true })
+  page.once('dialog', async confirmation => {
+    expect(confirmation.message()).toContain('第 2–3 章')
+    expect(confirmation.message()).toContain('包含手动修改')
+    await confirmation.dismiss()
+  })
+  await dialog.getByRole('button', { name: '开始预解析' }).click()
+  expect(requests).toHaveLength(0)
+  await expect(dialog).toBeVisible()
+  page.once('dialog', confirmation => confirmation.accept())
+  await dialog.getByRole('button', { name: '开始预解析' }).click()
+  await expect(dialog).toBeHidden()
+  expect(requests).toEqual([{ type: 'preprocess', payload: { from_included_position: 2, to_included_position: 3, force_regenerate: true } }])
+  await expect(page.locator('.progress-copy strong')).toHaveText('0%')
+  await expect(page.getByText('预解析进度 · 本次 0/2 章')).toBeVisible()
+  await page.reload()
+  await expect(page.locator('.progress-copy strong')).toHaveText('0%')
+})
+
+test('allows TTS only for a fully parsed range without waiting for other chapters', async ({ page }) => {
+  const chapters = ['pending', 'reviewed', 'done', 'pending'].map((status, index) => ({ id: index + 1, position: index + 1, included_position: index + 1, included: true, title: `第${index + 1}章`, status }))
+  const requests: Record<string, unknown>[] = []
+  await page.route('**/api/v1/**', async route => {
+    const path = new URL(route.request().url()).pathname
+    if (path === '/api/v1/projects/partial-book/jobs' && route.request().method() === 'POST') {
+      requests.push(route.request().postDataJSON())
+      await route.fulfill({ status: 201, json: { id: 'tts-1', type: 'render', status: 'queued' } })
+      return
+    }
+    const responses: Record<string, unknown> = {
+      '/api/v1/projects/partial-book': { id: 'partial-book', title: '局部 TTS 测试', source_filename: 'book.epub', status: 'ready', latest_job: null, settings: {}, chapter_count: 4 },
+      '/api/v1/projects/partial-book/chapters': chapters,
+      '/api/v1/projects/partial-book/voice-pool': { excluded_voice_ids: [], narrator_voice_profile_id: 'voice-1' },
+      '/api/v1/projects/partial-book/bilibili': { continuous_audio_count: 0, prepared_count: 0, published_count: 0, appendable_count: 0, chapters: [], form: {}, publication: null },
+      '/api/v1/chapters/1/script': { revision: 0, entries: [] },
+    }
+    await route.fulfill({ json: responses[path] ?? [] })
+  })
+  await page.goto('/projects/partial-book')
+  await expect(page.getByRole('button', { name: '开始 TTS' })).toBeEnabled()
+  await page.getByRole('button', { name: '开始 TTS' }).click()
+  const dialog = page.getByRole('dialog')
+  await expect(dialog.getByRole('button', { name: '开始 TTS' })).toBeDisabled()
+  await expect(dialog.getByText(/所选范围有未完成预解析/)).toBeVisible()
+  await page.getByLabel('从第几章').fill('2')
+  await page.getByLabel('到第几章').fill('3')
+  await expect(dialog.getByRole('button', { name: '开始 TTS' })).toBeEnabled()
+  await dialog.getByRole('button', { name: '开始 TTS' }).click()
+  expect(requests).toEqual([{ type: 'render', payload: { from_included_position: 2, to_included_position: 3 } }])
+})
+
+test('refreshes a replaced script while retaining edits when its revision is unchanged', async ({ page }) => {
+  let revision = 'old'
+  let scriptReads = 0
+  await page.route('**/api/v1/**', async route => {
+    const path = new URL(route.request().url()).pathname
+    if (path === '/api/v1/chapters/1/script') scriptReads += 1
+    const responses: Record<string, unknown> = {
+      '/api/v1/projects/refresh-book': { id: 'refresh-book', title: '脚本刷新测试', source_filename: 'book.epub', status: 'ready_for_tts', latest_job: { id: 'preprocess-1', type: 'preprocess', status: 'completed', payload: {} }, settings: {}, chapter_count: 1 },
+      '/api/v1/projects/refresh-book/chapters': [{ id: 1, position: 1, included_position: 1, included: true, title: '第一章', status: 'reviewed', active_revision_id: revision }],
+      '/api/v1/projects/refresh-book/voice-pool': { excluded_voice_ids: [], narrator_voice_profile_id: null },
+      '/api/v1/projects/refresh-book/bilibili': { continuous_audio_count: 0, prepared_count: 0, published_count: 0, appendable_count: 0, chapters: [], form: {}, publication: null },
+      '/api/v1/chapters/1/script': { chapter_id: 1, revision: revision === 'old' ? 1 : 2, kind: 'reviewed', entries: [{ speaker: 'NARRATOR', text: revision === 'old' ? '旧脚本' : '重新生成的脚本', instruct: '' }] },
+    }
+    await route.fulfill({ json: responses[path] ?? [] })
+  })
+  await page.goto('/projects/refresh-book')
+  await expect(page.getByRole('textbox', { name: '文本', exact: true })).toHaveValue('旧脚本')
+  await page.getByRole('textbox', { name: '文本', exact: true }).fill('未保存的修改')
+  const nav = page.getByRole('navigation', { name: '项目内容' })
+  await nav.getByRole('button', { name: /日志/ }).click()
+  await page.getByRole('button', { name: '刷新', exact: true }).click()
+  await nav.getByRole('button', { name: '章节 1', exact: true }).click()
+  await expect(page.getByRole('textbox', { name: '文本', exact: true })).toHaveValue('未保存的修改')
+  expect(scriptReads).toBe(1)
+  revision = 'new'
+  await nav.getByRole('button', { name: /日志/ }).click()
+  await page.getByRole('button', { name: '刷新', exact: true }).click()
+  await nav.getByRole('button', { name: '章节 1', exact: true }).click()
+  await expect(page.getByRole('textbox', { name: '文本', exact: true })).toHaveValue('重新生成的脚本')
+  expect(scriptReads).toBe(2)
 })
 
 test('selects a temporary TTS range and starts a merge job when every chapter has audio', async ({ page }) => {

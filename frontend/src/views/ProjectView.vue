@@ -23,9 +23,9 @@ const excludedVoiceIds = ref<string[]>([])
 const narratorVoiceId = ref<string | null>(null)
 const connected = ref(false)
 const activeTab = ref<'chapters' | 'characters' | 'settings' | 'artifacts' | 'bilibili' | 'logs'>('chapters')
-const showTtsRange = ref(false)
-const ttsFrom = ref<number | ''>(1)
-const ttsTo = ref<number | ''>(1)
+const rangeJobType = ref<'preprocess' | 'render' | null>(null)
+const rangeFrom = ref<number | ''>(1)
+const rangeTo = ref<number | ''>(1)
 const includedChapterIds = ref<number[]>([])
 const chapterSelectionDirty = ref(false)
 const savingChapters = ref(false)
@@ -41,12 +41,20 @@ const scriptEditable = computed(() => ['paused', 'completed'].includes(job.value
 const includedIdSet = computed(() => new Set(includedChapterIds.value))
 const includedChapters = computed(() => store.chapters.filter(chapter => includedIdSet.value.has(chapter.id)))
 const selectedChapters = computed(() => {
-  if (job.value?.type !== 'render') return includedChapters.value
+  if (job.value?.type === 'preprocess' && Array.isArray(job.value.payload?.chapter_ids)) {
+    const ids = new Set(job.value.payload.chapter_ids)
+    return includedChapters.value.filter(chapter => ids.has(chapter.id))
+  }
+  if (!job.value || !['render', 'preprocess'].includes(job.value.type)) return includedChapters.value
   const start = Number(job.value.payload?.from_included_position || 1)
   const end = Number(job.value.payload?.to_included_position || includedChapters.value.length)
   return includedChapters.value.slice(start - 1, end)
 })
 const progress = computed(() => {
+  if (job.value?.type === 'preprocess' && job.value.progress) {
+    const { completed, total } = job.value.progress
+    return total ? Math.round(completed / total * 100) : job.value.status === 'completed' ? 100 : 0
+  }
   if (job.value?.type === 'bilibili') {
     if (job.value.status === 'completed') return 100
     if (job.value.payload?.action === 'prepare') {
@@ -74,13 +82,16 @@ const uploadProgress = computed(() => {
   const uploaded = Math.min(total, Number(job.value.payload?.uploaded_parts || 0))
   return `本次已上传 ${uploaded}/${total} 个分P${uploaded === total ? '，等待远端确认' : ''}`
 })
-const canRender = computed(() => !chapterSelectionDirty.value && Boolean(narratorVoiceId.value) && includedChapters.value.length > 0 && includedChapters.value.every(chapter => ['reviewed', 'done'].includes(chapter.status)))
+const canRender = computed(() => !chapterSelectionDirty.value && Boolean(narratorVoiceId.value) && includedChapters.value.some(chapter => ['reviewed', 'done'].includes(chapter.status)))
 const canMerge = computed(() => !chapterSelectionDirty.value && includedChapters.value.length > 0 && includedChapters.value.every(chapter =>
   store.artifacts.some(artifact => artifact.kind === 'chapter_mp3' && artifact.chapter_id === chapter.id),
 ))
 const jobLabel = computed(() => job.value?.type === 'render' ? 'TTS' : job.value?.type === 'merge' ? '整书合成' : job.value?.type === 'character_analysis' ? '角色分析' : job.value?.type === 'bilibili' ? `B站${{ prepare: '视频准备', publish: '首发', append: '追加', replace: '替换' }[String(job.value.payload?.action)] || '投稿'}` : '预解析')
 const pendingCharacterCount = computed(() => store.characters.filter(character => !character.gender || !character.personality).length)
-const ttsRangeValid = computed(() => Number(ttsFrom.value) >= 1 && Number(ttsTo.value) >= Number(ttsFrom.value) && Number(ttsTo.value) <= includedChapters.value.length)
+const rangeValid = computed(() => Number.isInteger(rangeFrom.value) && Number.isInteger(rangeTo.value)
+  && Number(rangeFrom.value) >= 1 && Number(rangeTo.value) >= Number(rangeFrom.value) && Number(rangeTo.value) <= includedChapters.value.length)
+const rangeReady = computed(() => rangeValid.value && includedChapters.value.slice(Number(rangeFrom.value) - 1, Number(rangeTo.value))
+  .every(chapter => ['reviewed', 'done'].includes(chapter.status)))
 const allowedVoiceIds = computed(() => new Set(voices.value.filter(voice => voice.enabled && !excludedVoiceIds.value.includes(voice.id)).map(voice => voice.id)))
 
 watch(() => job.value?.error, error => { if (error) notifyError(error) })
@@ -100,6 +111,8 @@ function playVoice(id: string | null) {
 }
 
 async function refresh() {
+  const previousChapterId = selectedId.value
+  const previousRevision = activeChapter.value?.active_revision_id
   const [, voiceRows, bilibili] = await Promise.all([
     store.loadProject(projectId.value),
     api.get<VoiceProfile[]>('/api/v1/voices'),
@@ -122,6 +135,9 @@ async function refresh() {
   }
   if (!chapterSelectionDirty.value) includedChapterIds.value = store.chapters.filter(chapter => chapter.included).map(chapter => chapter.id)
   if (selectedId.value === null && store.chapters[0]) await selectChapter((store.chapters.find(chapter => chapter.included) || store.chapters[0]).id)
+  else if (selectedId.value !== null && selectedId.value === previousChapterId && activeChapter.value?.active_revision_id !== previousRevision) {
+    await selectChapter(selectedId.value)
+  }
 }
 function setChapterIncluded(id: number, included: boolean) {
   includedChapterIds.value = included
@@ -169,25 +185,30 @@ async function selectChapter(id: number) {
   selectedId.value = id
   script.value = await api.get<Script>(`/api/v1/chapters/${id}/script`)
 }
-async function startJob(type: 'preprocess' | 'merge' | 'character_analysis') {
+async function startJob(type: 'merge' | 'character_analysis') {
   message.value = ''
   try { await api.post(`/api/v1/projects/${projectId.value}/jobs`, { type }); await refresh() }
   catch (reason) { message.value = (reason as Error).message }
 }
-function openTtsRange() {
-  ttsFrom.value = 1
-  ttsTo.value = includedChapters.value.length
-  showTtsRange.value = true
+function openRange(type: 'preprocess' | 'render') {
+  rangeFrom.value = 1
+  rangeTo.value = includedChapters.value.length
+  rangeJobType.value = type
 }
-async function startTts() {
-  if (!ttsRangeValid.value) return
+async function startRangeJob() {
+  if (!rangeJobType.value || !rangeValid.value || (rangeJobType.value === 'render' && !rangeReady.value)) return
+  const type = rangeJobType.value
+  if (type === 'preprocess' && !window.confirm(`重新预解析第 ${rangeFrom.value}–${rangeTo.value} 章将重新调用 Generate 和 Review，替换当前脚本（包含手动修改），并使相关音频失效。历史脚本版本会保留。继续吗？`)) return
   message.value = ''
   try {
     await api.post(`/api/v1/projects/${projectId.value}/jobs`, {
-      type: 'render',
-      payload: { from_included_position: Number(ttsFrom.value), to_included_position: Number(ttsTo.value) },
+      type,
+      payload: {
+        from_included_position: Number(rangeFrom.value), to_included_position: Number(rangeTo.value),
+        ...(type === 'preprocess' ? { force_regenerate: true } : {}),
+      },
     })
-    showTtsRange.value = false
+    rangeJobType.value = null
     await refresh()
   } catch (reason) { message.value = (reason as Error).message }
 }
@@ -225,8 +246,8 @@ onBeforeUnmount(() => { window.clearTimeout(refreshTimer); previewAudio?.pause()
 <template>
   <section v-if="store.current" class="page project-page">
     <button class="back-link" @click="router.push('/')"><ArrowLeft :size="17" />返回项目</button>
-    <div class="project-heading"><div><span class="eyebrow">{{ store.current.source_filename }}</span><h1>{{ store.current.title }}</h1><div class="connection"><component :is="connected ? Wifi : WifiOff" :size="14" />{{ connected ? '实时进度已连接' : '正在重连进度' }}</div></div><div class="heading-actions"><button v-if="job?.status === 'failed'" class="button secondary" @click="control('retry')"><RefreshCw :size="17" />重试{{ jobLabel }}</button><button v-else-if="job?.status === 'paused' || job?.status === 'interrupted'" class="button secondary" @click="control('resume')"><Play :size="17" />继续{{ jobLabel }}</button><button v-else-if="running" class="button secondary" @click="control('pause')"><Pause :size="17" />暂停</button><template v-else><button class="button secondary" :disabled="chapterSelectionDirty" @click="reparse"><RotateCcw :size="17" />重新识别章节</button><button class="button secondary" :disabled="chapterSelectionDirty" @click="startJob('preprocess')"><RefreshCw :size="17" />{{ store.current.status === 'ready' ? '开始预解析' : '重新预解析' }}</button><button class="button primary" :disabled="!canRender" :title="narratorVoiceId ? '全部启用章节预解析成功后可选择本次 TTS 范围' : '请先在项目设置中选择旁白音色'" @click="openTtsRange"><Play :size="17" />开始 TTS</button><button class="button secondary" :disabled="!canMerge" title="全部启用章节都有有效音频后可用" @click="startJob('merge')"><FileAudio :size="17" />合成整书</button></template><button v-if="job && !['completed', 'cancelled'].includes(job.status)" class="button danger" @click="control('cancel')"><XCircle :size="17" />取消</button></div></div>
-    <div class="progress-panel"><div class="progress-copy"><div><strong>{{ progress }}%</strong><span>{{ jobLabel }}进度</span></div><StatusBadge :status="running || job?.status === 'paused' ? (job?.status || store.current.status) : store.current.status" /></div><div class="progress-track"><span :style="{ width: `${progress}%` }" /></div><div class="pipeline-legend"><span><i class="dot review" />预解析：{{ includedChapters.filter(c => ['reviewed', 'rendering', 'done'].includes(c.status)).length }}/{{ includedChapters.length }}</span><span><i class="dot audio" />音频：{{ includedChapters.filter(c => c.status === 'done').length }}/{{ includedChapters.length }}</span><span><i class="dot video" />准备视频：{{ bilibiliStatus?.prepared_count || 0 }}/{{ includedChapters.length }}</span><span><i class="dot publish" />发布：{{ bilibiliStatus?.published_count || 0 }}/{{ includedChapters.length }}</span><span>{{ canRender ? '启用章节预解析已完成' : 'TTS 等待预解析完成' }}</span></div></div>
+    <div class="project-heading"><div><span class="eyebrow">{{ store.current.source_filename }}</span><h1>{{ store.current.title }}</h1><div class="connection"><component :is="connected ? Wifi : WifiOff" :size="14" />{{ connected ? '实时进度已连接' : '正在重连进度' }}</div></div><div class="heading-actions"><button v-if="job?.status === 'failed'" class="button secondary" @click="control('retry')"><RefreshCw :size="17" />重试{{ jobLabel }}</button><button v-else-if="job?.status === 'paused' || job?.status === 'interrupted'" class="button secondary" @click="control('resume')"><Play :size="17" />继续{{ jobLabel }}</button><button v-else-if="running" class="button secondary" @click="control('pause')"><Pause :size="17" />暂停</button><template v-else><button class="button secondary" :disabled="chapterSelectionDirty" @click="reparse"><RotateCcw :size="17" />重新识别章节</button><button class="button secondary" :disabled="chapterSelectionDirty" @click="openRange('preprocess')"><RefreshCw :size="17" />{{ store.current.status === 'ready' ? '开始预解析' : '重新预解析' }}</button><button class="button primary" :disabled="!canRender" :title="narratorVoiceId ? '选择已完成预解析的章节范围进行 TTS' : '请先在项目设置中选择旁白音色'" @click="openRange('render')"><Play :size="17" />开始 TTS</button><button class="button secondary" :disabled="!canMerge" title="全部启用章节都有有效音频后可用" @click="startJob('merge')"><FileAudio :size="17" />合成整书</button></template><button v-if="job && !['completed', 'cancelled'].includes(job.status)" class="button danger" @click="control('cancel')"><XCircle :size="17" />取消</button></div></div>
+    <div class="progress-panel"><div class="progress-copy"><div><strong>{{ progress }}%</strong><span>{{ jobLabel }}进度<template v-if="job?.type === 'preprocess' && job.progress"> · 本次 {{ job.progress.completed }}/{{ job.progress.total }} 章</template></span></div><StatusBadge :status="running || job?.status === 'paused' ? (job?.status || store.current.status) : store.current.status" /></div><div class="progress-track"><span :style="{ width: `${progress}%` }" /></div><div class="pipeline-legend"><span><i class="dot review" />预解析：{{ includedChapters.filter(c => ['reviewed', 'rendering', 'done'].includes(c.status)).length }}/{{ includedChapters.length }}</span><span><i class="dot audio" />音频：{{ includedChapters.filter(c => c.status === 'done').length }}/{{ includedChapters.length }}</span><span><i class="dot video" />准备视频：{{ bilibiliStatus?.prepared_count || 0 }}/{{ includedChapters.length }}</span><span><i class="dot publish" />发布：{{ bilibiliStatus?.published_count || 0 }}/{{ includedChapters.length }}</span><span>{{ canRender ? '可选择已解析章节进行 TTS' : 'TTS 等待预解析完成' }}</span></div></div>
     <p v-if="uploadProgress" class="inline-message">{{ uploadProgress }}</p>
     <p v-if="message" class="inline-message">{{ message }}</p>
     <div class="section-layout project-section-layout">
@@ -250,15 +271,17 @@ onBeforeUnmount(() => { window.clearTimeout(refreshTimer); previewAudio?.pause()
         <section v-else class="log-panel panel"><div class="panel-heading"><h2>活动日志</h2><button class="icon-button" title="刷新" @click="refresh"><RefreshCw :size="16" /></button></div><div class="log-list"><p v-for="event in store.events.slice(-80).reverse()" :key="event.event_id"><time>{{ new Date(event.timestamp).toLocaleTimeString() }}</time><strong>{{ event.type }}</strong><span>{{ String(event.payload.message || event.payload.position || '') }}</span></p><p v-if="!store.events.length" class="muted">任务启动后，阶段日志会显示在这里。</p></div></section>
       </div>
     </div>
-    <div v-if="showTtsRange" class="modal-backdrop" @click.self="showTtsRange = false">
-      <form class="dialog tts-dialog" role="dialog" aria-modal="true" aria-labelledby="tts-range-title" @submit.prevent="startTts">
-        <h2 id="tts-range-title">本次 TTS 范围</h2>
+    <div v-if="rangeJobType" class="modal-backdrop" @click.self="rangeJobType = null">
+      <form class="dialog tts-dialog" role="dialog" aria-modal="true" aria-labelledby="job-range-title" @submit.prevent="startRangeJob">
+        <h2 id="job-range-title">{{ rangeJobType === 'preprocess' ? '本次预解析范围' : '本次 TTS 范围' }}</h2>
         <p class="muted">按当前已启用章节的连续序号选择；不会改变章节启用状态。</p>
         <div class="form-grid">
-          <label>从第几章<input v-model.number="ttsFrom" type="number" min="1" :max="includedChapters.length" required /></label>
-          <label>到第几章<input v-model.number="ttsTo" type="number" min="1" :max="includedChapters.length" required /></label>
+          <label>从第几章<input v-model.number="rangeFrom" type="number" min="1" :max="includedChapters.length" required /></label>
+          <label>到第几章<input v-model.number="rangeTo" type="number" min="1" :max="includedChapters.length" required /></label>
         </div>
-        <footer><button type="button" class="button secondary" @click="showTtsRange = false">取消</button><button class="button primary" :disabled="!ttsRangeValid"><Play :size="15" />开始 TTS</button></footer>
+        <p v-if="rangeJobType === 'preprocess'" class="form-error">将重新运行 Generate 和 Review，包含手动修改的脚本；历史版本保留，相关音频需重新渲染。</p>
+        <p v-else-if="rangeValid && !rangeReady" class="form-error">所选范围有未完成预解析的章节，请缩小范围或先完成预解析。</p>
+        <footer><button type="button" class="button secondary" @click="rangeJobType = null">取消</button><button class="button primary" :disabled="!rangeValid || (rangeJobType === 'render' && !rangeReady)"><Play :size="15" />{{ rangeJobType === 'preprocess' ? '开始预解析' : '开始 TTS' }}</button></footer>
       </form>
     </div>
   </section>

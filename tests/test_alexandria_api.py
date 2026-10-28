@@ -89,6 +89,35 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(reparsed.status_code, 200)
         self.assertIsNone(reparsed.json()["latest_job"])
 
+    def test_preprocess_range_validation_snapshot_and_progress(self):
+        created = self.client.post(
+            "/api/v1/projects",
+            files={"file": ("book.txt", BytesIO("第1章\n正文\n第2章\n正文\n第3章\n正文".encode("utf-8")), "text/plain")},
+        )
+        project_id = created.json()["id"]
+        chapters = self.client.get(f"/api/v1/projects/{project_id}/chapters").json()
+        for payload in (
+            {"force_regenerate": "true"}, {"force_regenerate": 1}, {"force_regenerate": None},
+            {"from_included_position": 0}, {"to_included_position": 4},
+            {"from_included_position": 3, "to_included_position": 2},
+            {"from_included_position": 1.5}, {"to_included_position": True},
+            {"from_included_position": "bad"},
+        ):
+            with self.subTest(payload=payload):
+                response = self.client.post(f"/api/v1/projects/{project_id}/jobs", json={"type": "preprocess", "payload": payload})
+                self.assertEqual(response.status_code, 422, response.text)
+                self.assertIsNone(self.client.get(f"/api/v1/projects/{project_id}").json()["latest_job"])
+        response = self.client.post(f"/api/v1/projects/{project_id}/jobs", json={"type": "preprocess", "payload": {
+            "force_regenerate": True, "from_included_position": 2, "to_included_position": 2,
+            "chapter_ids": [chapters[0]["id"]],
+        }})
+        self.assertEqual(response.status_code, 201, response.text)
+        job = response.json()
+        self.assertEqual(job["payload"]["chapter_ids"], [chapters[1]["id"]])
+        self.assertEqual(job["progress"], {"completed": 0, "total": 1})
+        self.assertEqual(self.client.get(f"/api/v1/jobs/{job['id']}").json()["progress"], job["progress"])
+        self.assertEqual(self.client.get(f"/api/v1/projects/{project_id}").json()["latest_job"]["progress"], job["progress"])
+
     def test_chapter_inclusion_endpoint(self):
         created = self.client.post(
             "/api/v1/projects",

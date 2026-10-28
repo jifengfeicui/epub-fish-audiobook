@@ -13,6 +13,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Callable
 
+from app.llm_json import create_json_completion
 from backend.alexandria.db.repository import Repository
 
 
@@ -127,6 +128,7 @@ class StageExecutor:
                 "user_prompt": app_config["prompts"].get("user_prompt"),
             },
             "generate_script": self._file_hash(self.root / "app" / "generate_script.py"),
+            "llm_json": self._file_hash(self.root / "app" / "llm_json.py"),
             "script_validation": self._file_hash(self.root / "app" / "script_validation.py"),
             "default_prompts": self._file_hash(self.root / "default_prompts.txt"),
         })
@@ -147,6 +149,7 @@ class StageExecutor:
                 "review_user_prompt": app_config["prompts"].get("review_user_prompt"),
             },
             "review_script": self._file_hash(self.root / "app" / "review_script.py"),
+            "llm_json": self._file_hash(self.root / "app" / "llm_json.py"),
             "script_validation": self._file_hash(self.root / "app" / "script_validation.py"),
             "default_prompts": self._file_hash(self.root / "review_prompts.txt"),
         })
@@ -256,7 +259,7 @@ class StageExecutor:
         for offset in range(0, len(pending), 25):
             batch = pending[offset:offset + 25]
             payload = [{"speaker": row["speaker"], "lines": samples[row["speaker"]]} for row in batch]
-            response = client.chat.completions.create(
+            response = create_json_completion(client,
                 model=settings.get("llm_model", "local-model"),
                 messages=[
                     {"role": "system", "content": "Return only a JSON array. Infer audiobook character metadata from quoted lines. Use 未知 when gender cannot be inferred."},

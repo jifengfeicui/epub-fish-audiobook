@@ -4,6 +4,7 @@ import json
 import re
 import argparse
 from openai import OpenAI
+from llm_json import create_json_completion
 from review_prompts import REVIEW_SYSTEM_PROMPT, REVIEW_USER_PROMPT
 from generate_script import annotation_response_format, annotations_to_entries, clean_json_string, repair_json_array
 from script_validation import (
@@ -127,7 +128,7 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
 
     for attempt in range(max_retries + 1):
         try:
-            response = client.chat.completions.create(
+            response = create_json_completion(client,
                 model=model_name,
                 messages=[
                     {"role": "system", "content": sys_prompt},

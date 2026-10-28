@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import joinedload, selectinload
@@ -38,6 +39,7 @@ ACTIVE_JOB_STATES = ("queued", "running", "pausing")
 OPEN_JOB_STATES = (*ACTIVE_JOB_STATES, "paused", "interrupted", "failed")
 EDITABLE_JOB_STATES = ("paused", "completed")
 SECRET_KEYS = {"llm_api_key", "fish_api_key"}
+LLM_FIELDS = {"llm_base_url": "base_url", "llm_api_key": "api_key", "llm_model": "model"}
 
 
 def _hash_json(value: Any) -> str:
@@ -273,6 +275,9 @@ class Repository:
         try:
             start_value = payload.get("from_included_position")
             end_value = payload.get("to_included_position")
+            if any(value is not None and (isinstance(value, bool) or not isinstance(value, (int, str)))
+                   for value in (start_value, end_value)):
+                raise ValueError("invalid_chapter_range")
             start = 1 if start_value is None else int(start_value)
             end = len(chapters) if end_value is None else int(end_value)
         except (TypeError, ValueError):
@@ -280,6 +285,13 @@ class Repository:
         if start < 1 or end < start or end > len(chapters):
             raise RuntimeError("invalid_chapter_range")
         return [row for row in chapters if start <= row["included_position"] <= end]
+
+    def list_job_chapters(self, job: dict[str, Any]) -> list[dict[str, Any]]:
+        payload = job["payload"]
+        if job["type"] == "preprocess" and "chapter_ids" in payload:
+            chapter_ids = set(payload["chapter_ids"])
+            return [chapter for chapter in self.list_included_chapters(job["project_id"]) if chapter["id"] in chapter_ids]
+        return self.list_selected_chapters(job["project_id"], payload)
 
     def _has_bilibili_publication(self, project_id: str) -> bool:
         try:
@@ -386,6 +398,9 @@ class Repository:
             session.add(revision)
             chapter.active_revision_id = revision_id
             chapter.status = "reviewed" if kind in ("reviewed", "manual") else "generated"
+            session.execute(update(Artifact).where(Artifact.chapter_id == chapter_id, Artifact.status == "active").values(status="stale"))
+            session.execute(update(Artifact).where(Artifact.project_id == chapter.project_id, Artifact.chapter_id.is_(None), Artifact.status == "active").values(status="stale"))
+            session.execute(update(AudioSegment).where(AudioSegment.chapter_id == chapter_id).values(status="stale"))
         return self.get_script(chapter_id)
 
     def latest_revision(self, chapter_id: int, kind: str) -> dict[str, Any] | None:
@@ -413,11 +428,6 @@ class Repository:
         project_id = chapter.project_id
         result = self.save_revision(chapter_id, "manual", entries)
         with self.db.session() as session, session.begin():
-            session.execute(update(Artifact).where(Artifact.chapter_id == chapter_id, Artifact.status == "active").values(status="stale"))
-            session.execute(update(Artifact).where(Artifact.project_id == project_id, Artifact.chapter_id.is_(None), Artifact.status == "active").values(status="stale"))
-            session.execute(update(AudioSegment).where(AudioSegment.chapter_id == chapter_id).values(status="stale"))
-            chapter = session.get(Chapter, chapter_id)
-            chapter.status = "reviewed"
             project = session.get(Project, project_id)
             project.status = "ready_for_tts"
             project.updated_at = utcnow()
@@ -442,7 +452,12 @@ class Repository:
             )).all():
                 if self.job_key(existing.job_type, json.loads(existing.payload_json or "{}")) == key:
                     raise RuntimeError(f"job_exists:{existing.id}")
-            if job_type == "render":
+            if job_type == "preprocess":
+                if not isinstance(payload.get("force_regenerate", False), bool):
+                    raise RuntimeError("invalid_preprocess_options")
+                chapters = self.list_selected_chapters(project_id, payload)
+                payload = {**payload, "chapter_ids": [chapter["id"] for chapter in chapters]}
+            elif job_type == "render":
                 chapters = self.list_selected_chapters(project_id, payload)
                 ready = 0
                 for chapter in chapters:
@@ -503,9 +518,8 @@ class Repository:
             payload = json.loads(job.payload_json or "{}")
             job.payload_json = json.dumps({**payload, **values}, ensure_ascii=False)
 
-    @staticmethod
-    def job_dict(job: Job) -> dict[str, Any]:
-        return {
+    def job_dict(self, job: Job) -> dict[str, Any]:
+        result = {
             "id": job.id,
             "project_id": job.project_id,
             "type": job.job_type,
@@ -520,6 +534,22 @@ class Repository:
             "started_at": _iso(job.started_at),
             "finished_at": _iso(job.finished_at),
         }
+        if job.job_type == "preprocess":
+            chapters = self.list_job_chapters(result)
+            with self.db.session() as session:
+                completed = set(session.scalars(
+                    select(StageRun.chapter_id)
+                    .join(Chapter, Chapter.id == StageRun.chapter_id)
+                    .join(ScriptRevision, ScriptRevision.id == Chapter.active_revision_id)
+                    .where(
+                        StageRun.job_id == job.id, StageRun.stage == "review", StageRun.status == "completed",
+                        ScriptRevision.kind.in_(("reviewed", "manual")),
+                        ScriptRevision.content_hash == StageRun.output_hash,
+                        ScriptRevision.input_hash.is_not_distinct_from(StageRun.input_hash),
+                    )
+                ).all())
+            result["progress"] = {"completed": sum(chapter["id"] in completed for chapter in chapters), "total": len(chapters)}
+        return result
 
     @staticmethod
     def job_key(job_type: str, payload: dict[str, Any]) -> str:
@@ -666,9 +696,11 @@ class Repository:
     def _redact(self, value: Any, secrets: tuple[str, ...] | None = None) -> Any:
         if secrets is None:
             settings = self.get_settings(reveal_secrets=True)
-            secrets = tuple(str(settings[key]) for key in SECRET_KEYS if settings.get(key))
+            secret_values = [str(settings[key]) for key in SECRET_KEYS if settings.get(key)]
+            secret_values.extend(profile["api_key"] for profile in settings.get("llm_profiles", []) if profile.get("api_key"))
+            secrets = tuple(sorted(set(secret_values), key=len, reverse=True))
         if isinstance(value, dict):
-            return {key: ("***" if key in SECRET_KEYS else self._redact(item, secrets)) for key, item in value.items()}
+            return {key: ("***" if key in SECRET_KEYS or key == "api_key" else self._redact(item, secrets)) for key, item in value.items()}
         if isinstance(value, list):
             return [self._redact(item, secrets) for item in value]
         if isinstance(value, str):
@@ -680,25 +712,87 @@ class Repository:
         with self.db.session() as session:
             rows = session.scalars(select(AppSetting)).all()
             result = {row.key: json.loads(row.value_json) for row in rows}
+            if result.get("llm_profiles"):
+                profile = next(profile for profile in result["llm_profiles"] if profile["id"] == result["active_llm_profile_id"])
+                result.update({key: profile[field] for key, field in LLM_FIELDS.items()})
             if not reveal_secrets:
                 for key in SECRET_KEYS:
                     if result.get(key):
                         result[key] = "********"
+                for profile in result.get("llm_profiles", []):
+                    if profile["api_key"]:
+                        profile["api_key"] = "********"
             return result
+
+    @staticmethod
+    def _llm_profiles(settings: dict[str, Any]) -> tuple[list[dict[str, str]], str]:
+        if "llm_profiles" in settings:
+            return settings["llm_profiles"], settings["active_llm_profile_id"]
+        return [{
+            "id": "default", "name": "默认配置",
+            "base_url": settings.get("llm_base_url", "http://localhost:1234/v1"),
+            "api_key": settings.get("llm_api_key", "local"),
+            "model": settings.get("llm_model", "local-model"),
+        }], "default"
+
+    @staticmethod
+    def _validate_llm_profiles(profiles: list[dict[str, Any]], active_id: str) -> None:
+        ids = set()
+        for profile in profiles:
+            if any(not isinstance(profile.get(field), str) or not profile[field].strip()
+                   for field in ("id", "name", "base_url", "model")):
+                raise ValueError("invalid_llm_profiles")
+            if not isinstance(profile.get("api_key"), str) or profile["id"] in ids:
+                raise ValueError("invalid_llm_profiles")
+            try:
+                url = urlsplit(profile["base_url"])
+                valid = (
+                    url.scheme in ("http", "https") and bool(url.hostname) and url.port != 0
+                    and not any(char.isspace() for char in profile["base_url"])
+                )
+            except ValueError:
+                valid = False
+            if not valid:
+                raise ValueError("invalid_llm_profiles")
+            ids.add(profile["id"])
+        if not profiles or active_id not in ids:
+            raise ValueError("invalid_llm_profiles")
 
     def update_settings(self, values: dict[str, Any]) -> dict[str, Any]:
         with self.db.session() as session, session.begin():
             active = session.scalar(select(Job.id).where(Job.status.in_(ACTIVE_JOB_STATES)).limit(1))
             if active:
                 raise RuntimeError("active_job")
+            values = {key: value for key, value in values.items() if value is not None}
+            stored = {row.key: json.loads(row.value_json) for row in session.scalars(select(AppSetting)).all()}
+            profiles, active_id = self._llm_profiles(stored)
+            old_profiles = {profile["id"]: profile for profile in profiles}
+            active_id = values.get("active_llm_profile_id", active_id)
+            if "llm_profiles" in values:
+                profiles = values["llm_profiles"]
+            elif "active_llm_profile_id" not in values:
+                for profile in profiles:
+                    if profile["id"] == active_id:
+                        profile.update({field: values[key] for key, field in LLM_FIELDS.items()
+                                        if key in values and not (key == "llm_api_key" and values[key] == "********")})
+            self._validate_llm_profiles(profiles, active_id)
+            profiles = [{field: profile[field] for field in ("id", "name", "base_url", "api_key", "model")} for profile in profiles]
+            for profile in profiles:
+                if profile["api_key"] == "********":
+                    if profile["id"] not in old_profiles:
+                        raise ValueError("invalid_llm_api_key")
+                    profile["api_key"] = old_profiles[profile["id"]]["api_key"]
+            values = {key: value for key, value in values.items() if key not in LLM_FIELDS}
+            values.update(llm_profiles=profiles, active_llm_profile_id=active_id)
             for key, value in values.items():
                 if value is None or (key in SECRET_KEYS and value == "********"):
                     continue
                 row = session.get(AppSetting, key)
                 if row is None:
-                    session.add(AppSetting(key=key, value_json=json.dumps(value, ensure_ascii=False), is_secret=key in SECRET_KEYS))
+                    session.add(AppSetting(key=key, value_json=json.dumps(value, ensure_ascii=False), is_secret=key in SECRET_KEYS or key == "llm_profiles"))
                 else:
                     row.value_json = json.dumps(value, ensure_ascii=False)
+            session.execute(delete(AppSetting).where(AppSetting.key.in_(LLM_FIELDS)))
         return self.get_settings()
 
     def seed_settings(self, defaults: dict[str, Any]) -> None:
@@ -706,6 +800,13 @@ class Repository:
             for key, value in defaults.items():
                 if session.get(AppSetting, key) is None:
                     session.add(AppSetting(key=key, value_json=json.dumps(value, ensure_ascii=False), is_secret=key in SECRET_KEYS))
+            session.flush()
+            stored = {row.key: json.loads(row.value_json) for row in session.scalars(select(AppSetting)).all()}
+            if "llm_profiles" not in stored:
+                profiles, active_id = self._llm_profiles(stored)
+                session.add(AppSetting(key="llm_profiles", value_json=json.dumps(profiles, ensure_ascii=False), is_secret=True))
+                session.add(AppSetting(key="active_llm_profile_id", value_json=json.dumps(active_id), is_secret=False))
+            session.execute(delete(AppSetting).where(AppSetting.key.in_(LLM_FIELDS)))
 
     def list_voices(self) -> list[dict[str, Any]]:
         with self.db.session() as session:
@@ -1150,6 +1251,15 @@ class Repository:
                 StageRun.stage == stage,
                 StageRun.status == "completed",
             )).all())
+
+    def get_stage_runs(self, job_id: str) -> dict[tuple[int, str], dict[str, Any]]:
+        with self.db.session() as session:
+            return {
+                (row.chapter_id, row.stage): {
+                    "status": row.status, "input_hash": row.input_hash, "output_hash": row.output_hash,
+                }
+                for row in session.scalars(select(StageRun).where(StageRun.job_id == job_id)).all()
+            }
 
     def save_audio_segment(self, *, project_id: str, chapter_id: int, revision_id: str, position: int, fingerprint: str, path: str, status: str, attempts: int, error: str | None = None) -> None:
         with self.db.session() as session, session.begin():

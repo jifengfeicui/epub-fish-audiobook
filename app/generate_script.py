@@ -4,6 +4,7 @@ import json
 import re
 import argparse
 from openai import OpenAI
+from llm_json import create_json_completion
 from default_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
 from script_validation import (
     compare_text_fidelity,
@@ -456,7 +457,7 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
     for attempt in range(max_retries + 1):
         try:
             request_prompt = user_prompt + retry_feedback
-            response = client.chat.completions.create(
+            response = create_json_completion(client,
                 model=model_name,
                 messages=[
                     {"role": "system", "content": sys_prompt},

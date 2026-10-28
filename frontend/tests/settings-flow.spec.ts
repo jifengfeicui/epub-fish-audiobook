@@ -2,6 +2,8 @@ import { expect, test } from '@playwright/test'
 
 const settings = {
   llm_base_url: 'http://localhost:1234/v1', llm_api_key: '', llm_model: 'local-model',
+  llm_profiles: [{ id: 'default', name: '默认配置', base_url: 'http://localhost:1234/v1', api_key: '', model: 'local-model' }],
+  active_llm_profile_id: 'default',
   fish_base_url: 'https://api.fish.audio', fish_api_key: '', fish_model: 's1', fish_workers: 5,
   generation: { chunk_size: 3000, max_tokens: 4096, review_batch_size: 25 },
   prompts: { system_prompt: 'generate system', user_prompt: 'generate user', review_system_prompt: 'review system', review_user_prompt: 'review user' },
@@ -47,6 +49,104 @@ test('paginates settings, retains edits, and saves voice gender radio', async ({
   await page.setViewportSize({ width: 390, height: 844 })
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true)
   await expect(nav).toHaveCSS('display', 'flex')
+})
+
+test('edits multiple LLM profiles, saves the selection, and confirms deletion', async ({ page }, testInfo) => {
+  let stored = structuredClone(settings)
+  let savedPayload: Record<string, unknown> | undefined
+  await page.route('**/api/v1/settings', async route => {
+    if (route.request().method() === 'PUT') {
+      const payload = route.request().postDataJSON() as typeof settings
+      savedPayload = payload as unknown as Record<string, unknown>
+      stored = { ...stored, ...payload, llm_profiles: payload.llm_profiles.map(profile => ({
+        ...profile, api_key: profile.api_key ? '********' : '',
+      })) }
+    }
+    await route.fulfill({ json: stored })
+  })
+  await page.route('**/api/v1/voices', route => route.fulfill({ json: [] }))
+  await page.route('**/api/v1/bilibili/account', route => route.fulfill({ json: { logged_in: false, name: null } }))
+  await page.goto('/settings')
+  const card = page.locator('.settings-card').filter({ has: page.getByRole('heading', { name: 'LLM Generate / Review', exact: true }) })
+  const selector = card.getByLabel('当前配置')
+  await expect(card.getByRole('button', { name: '删除配置' })).toBeDisabled()
+
+  await card.getByRole('button', { name: '新增配置' }).click()
+  await expect(card.getByLabel('服务地址')).toBeEmpty()
+  await expect(card.getByLabel('API Key')).toBeEmpty()
+  await expect(card.getByLabel('模型', { exact: true })).toBeEmpty()
+  await card.getByLabel('配置名称').fill('云端 A')
+  await card.getByLabel('服务地址').fill('https://a.example.test/v1')
+  await card.getByLabel('API Key').fill('key-a')
+  await card.getByLabel('模型', { exact: true }).fill('model-a')
+  await card.getByRole('button', { name: '新增配置' }).click()
+  await card.getByLabel('配置名称').fill('云端 B')
+  await card.getByLabel('服务地址').fill('https://b.example.test/v1')
+  await card.getByLabel('API Key').fill('key-b')
+  await card.getByLabel('模型', { exact: true }).fill('model-b')
+  await selector.selectOption({ label: '云端 A' })
+  await expect(card.getByLabel('服务地址')).toHaveValue('https://a.example.test/v1')
+  await expect(card.getByLabel('API Key')).toHaveValue('key-a')
+  await selector.selectOption({ label: '云端 B' })
+  await expect(card.getByLabel('模型', { exact: true })).toHaveValue('model-b')
+  const nav = page.getByRole('navigation', { name: '配置分类' })
+  await nav.getByRole('button', { name: 'Prompt', exact: true }).click()
+  await expect(page.getByLabel('Generate System')).toHaveValue('generate system')
+  await nav.getByRole('button', { name: '服务连接' }).click()
+  await expect(selector.locator('option:checked')).toHaveText('云端 B')
+  await page.getByRole('button', { name: '保存设置与音色' }).click()
+  await expect(page.getByText('设置已保存')).toBeVisible()
+  expect(savedPayload).not.toHaveProperty('llm_base_url')
+  expect(savedPayload).not.toHaveProperty('llm_api_key')
+  expect(savedPayload).not.toHaveProperty('llm_model')
+  expect(new Set(stored.llm_profiles.map(profile => profile.id)).size).toBe(3)
+  await expect(card.getByLabel('API Key')).toHaveValue('********')
+  await page.reload()
+  await expect(selector.locator('option:checked')).toHaveText('云端 B')
+  await expect(card.getByLabel('服务地址')).toHaveValue('https://b.example.test/v1')
+  await page.screenshot({ path: testInfo.outputPath('llm-desktop.png'), fullPage: true })
+  await page.setViewportSize({ width: 390, height: 844 })
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true)
+  await card.scrollIntoViewIfNeeded()
+  await page.screenshot({ path: testInfo.outputPath('llm-mobile.png'), fullPage: true })
+
+  page.once('dialog', dialog => dialog.dismiss())
+  await card.getByRole('button', { name: '删除配置' }).click()
+  await expect(selector.locator('option')).toHaveCount(3)
+  page.once('dialog', dialog => dialog.accept())
+  await card.getByRole('button', { name: '删除配置' }).click()
+  await expect(selector).toHaveValue('default')
+  expect(stored.llm_profiles).toHaveLength(3)
+  await selector.selectOption({ label: '云端 A' })
+  page.once('dialog', dialog => dialog.accept())
+  await card.getByRole('button', { name: '删除配置' }).click()
+  await expect(card.getByRole('button', { name: '删除配置' })).toBeDisabled()
+  await page.getByRole('button', { name: '保存设置与音色' }).click()
+  await expect.poll(() => stored.llm_profiles.length).toBe(1)
+  await page.reload()
+  await expect(selector).toHaveValue('default')
+  await expect(selector.locator('option')).toHaveCount(1)
+})
+
+test('retains LLM edits when saving is rejected by an active job', async ({ page }) => {
+  let voiceWrites = 0
+  await page.route('**/api/v1/settings', async route => {
+    await route.fulfill(route.request().method() === 'PUT'
+      ? { status: 409, json: { detail: '另一个任务正在运行' } }
+      : { json: settings })
+  })
+  await page.route('**/api/v1/voices', async route => {
+    if (route.request().method() === 'PUT') voiceWrites += 1
+    await route.fulfill({ json: [] })
+  })
+  await page.route('**/api/v1/bilibili/account', route => route.fulfill({ json: { logged_in: false, name: null } }))
+  await page.goto('/settings')
+  await page.getByLabel('配置名称').fill('未保存配置')
+  await page.getByRole('button', { name: '保存设置与音色' }).click()
+  await expect(page.locator('.settings-error')).toHaveText('另一个任务正在运行')
+  await expect(page.getByLabel('配置名称')).toHaveValue('未保存配置')
+  await expect(page.getByText('设置已保存')).toHaveCount(0)
+  expect(voiceWrites).toBe(0)
 })
 
 test('adds a voice from only its Fish id without rendering sample text', async ({ page }) => {
