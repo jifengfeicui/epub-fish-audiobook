@@ -5,19 +5,35 @@ async function setup(page: Page) {
   const runs: any[] = []
   const messages: any[] = []
   const decisions: any[] = []
+  const conversations = [{ id: 'default', title: '历史对话', created_at: new Date().toISOString() }]
   const chapters = [{ id: 1, included: true, included_position: 1, position: 1, title: '第一章 · 窗外', status: 'reviewed', active_revision_id: 'revision-1' }]
   let pending = false
   let disconnect = false
+  const settings = { agent_auto_apply_scripts: false }
+  const automations: any[] = []
+  let batch = false
   const proposal = () => ({ id: 'proposal-1', kind: 'script', status: 'pending', args: { chapter_id: 1, expected_revision: 1, summary: '将旁白语气调整得更沉稳', before: structuredClone(script.entries), entries: [{ speaker: 'NARRATOR', text: '他望向窗外。', instruct: '沉稳、舒缓' }], text_changed: false }, result: {} })
   await page.route('**/api/v1/**', async route => {
     const path = new URL(route.request().url()).pathname
+    if (path === '/api/v1/projects/book/automations') return route.fulfill({ json: { automations } })
+    if (path.startsWith('/api/v1/projects/book/automations/')) {
+      const id = path.split('/').at(-1)
+      const index = automations.findIndex(plan => plan.id === id)
+      if (route.request().method() === 'DELETE') { automations.splice(index, 1); return route.fulfill({ status: 204 }) }
+      Object.assign(automations[index], route.request().postDataJSON())
+      return route.fulfill({ json: automations[index] })
+    }
     if (path.endsWith('/agent/messages')) {
       const body = route.request().postDataJSON()
       messages.push(body)
       let run = runs.find(item => item.request_id === body.request_id)
       if (!run) {
-        run = { id: `run-${runs.length}`, request_id: body.request_id, message: body.message, status: 'completed', output: pending ? '已生成修改提案，请确认后保存。' : '已提交任务，进度请查看项目面板。', created_at: new Date().toISOString(), action: pending ? proposal() : { id: 'op-1', kind: 'task', status: 'completed', args: {}, result: { id: 'task-1' } } }
+        const action = batch ? { id: 'batch-1', kind: 'script_batch', status: 'applied', args: { summary: '删除重复开头', changes: [{ chapter_id: 1, expected_revision: script.revision, before: structuredClone(script.entries), entries: [{ speaker: 'NARRATOR', text: '正文保留。', instruct: '平静' }] }], skipped_count: 2 }, result: { modified_count: 1, skipped_count: 2 } } : pending ? proposal() : { id: 'op-1', kind: 'task', status: 'completed', args: {}, result: { id: 'task-1' } }
+        run = { id: `run-${runs.length}`, request_id: body.request_id, conversation_id: body.conversation_id, message: body.message, status: 'completed', auto_apply_scripts: settings.agent_auto_apply_scripts, output: batch ? '批量修改已保存。' : pending ? '已生成修改提案，请确认后保存。' : '已提交任务，进度请查看项目面板。', created_at: new Date().toISOString(), action }
         runs.push(run)
+        const conversation = conversations.find(item => item.id === body.conversation_id)
+        if (conversation?.title === '新对话') conversation.title = body.message.slice(0, 40)
+        if (batch) { script.revision++; script.entries = structuredClone(action.args.changes![0]!.entries) }
       }
       if (disconnect) { disconnect = false; return route.abort('failed') }
       return route.fulfill({ status: 202, json: run })
@@ -30,13 +46,32 @@ async function setup(page: Page) {
       if (body.approve) { script.revision++; script.kind = 'manual'; script.entries = structuredClone(action.args.entries) }
       return route.fulfill({ json: action })
     }
-    if (path.endsWith('/agent')) return route.fulfill({ json: { runs } })
+    if (path.endsWith('/agent/conversations')) {
+      if (route.request().method() === 'POST') {
+        const conversation = { id: `conversation-${conversations.length}`, title: '新对话', created_at: new Date().toISOString() }
+        conversations.push(conversation)
+        return route.fulfill({ status: 201, json: conversation })
+      }
+      return route.fulfill({ json: { conversations } })
+    }
+    if (path.includes('/agent/conversations/')) {
+      const conversation = conversations.find(item => item.id === path.split('/').at(-1))!
+      conversation.title = route.request().postDataJSON().title
+      return route.fulfill({ json: conversation })
+    }
+    if (path.endsWith('/agent')) {
+      const id = new URL(route.request().url()).searchParams.get('conversation_id') || 'default'
+      if (!conversations.some(item => item.id === id)) return route.fulfill({ status: 404, json: { detail: 'Resource not found' } })
+      return route.fulfill({ json: { runs: runs.filter(run => (run.conversation_id || 'default') === id), conversations,
+        conversation_id: id, project_busy: runs.some(run => run.status === 'running') } })
+    }
+    if (path === '/api/v1/projects/book' && route.request().method() === 'PATCH') Object.assign(settings, route.request().postDataJSON())
     if (path === '/api/v1/chapters/1/script') {
       if (route.request().method() === 'PATCH') { script.revision++; script.entries = route.request().postDataJSON().entries }
       return route.fulfill({ json: script })
     }
     const responses: Record<string, unknown> = {
-      '/api/v1/projects/book': { id: 'book', title: 'Agent 测试书', source_filename: '测试书.txt', status: 'ready_for_tts', latest_job: { id: 'completed-job', type: 'preprocess', status: 'completed', payload: {} }, settings: {}, chapter_count: 1 },
+      '/api/v1/projects/book': { id: 'book', title: 'Agent 测试书', source_filename: '测试书.txt', status: 'ready_for_tts', latest_job: { id: 'completed-job', type: 'preprocess', status: 'completed', payload: {} }, settings, chapter_count: 1 },
       '/api/v1/projects/book/chapters': chapters.map(chapter => ({ ...chapter, active_revision_id: `revision-${script.revision}` })),
       '/api/v1/projects/book/voice-pool': { excluded_voice_ids: [], narrator_voice_profile_id: null },
       '/api/v1/projects/book/bilibili': { chapters: [], form: {}, continuous_audio_count: 0 },
@@ -45,7 +80,7 @@ async function setup(page: Page) {
   })
   await page.goto('/projects/book')
   await expect(page.getByLabel('文本', { exact: true })).toHaveValue('他望向窗外。')
-  return { runs, messages, decisions, script, chapters, propose: () => { pending = true }, disconnect: () => { disconnect = true } }
+  return { runs, messages, decisions, conversations, script, chapters, settings, automations, batch: () => { batch = true }, propose: () => { pending = true }, disconnect: () => { disconnect = true } }
 }
 
 test('submits a task and restores its receipt after reload', async ({ page }) => {
@@ -55,11 +90,66 @@ test('submits a task and restores its receipt after reload', async ({ page }) =>
   await page.getByRole('button', { name: '发送指令', exact: true }).click()
   await expect(page.getByText('任务编号：task-1')).toBeVisible()
   expect(state.messages[0].selected_chapter_id).toBe(1)
-  expect(state.messages[0].allow_text_rewrite).toBe(false)
+  expect(state.messages[0].allow_text_rewrite).toBeUndefined()
   await page.reload()
   await page.getByRole('button', { name: 'Agent 助手' }).click()
   await expect(page.getByText('任务编号：task-1')).toBeVisible()
   expect(state.messages).toHaveLength(1)
+})
+
+test('new conversations isolate history, preserve drafts, and restore selection', async ({ page }) => {
+  const state = await setup(page)
+  await page.getByRole('button', { name: 'Agent 助手', exact: true }).click()
+  await page.getByLabel('给 Agent 的指令').fill('旧对话的请求')
+  await page.getByRole('button', { name: '发送指令', exact: true }).click()
+  await expect(page.getByText('任务编号：task-1')).toBeVisible()
+  await page.getByLabel('给 Agent 的指令').fill('旧对话的草稿')
+  await page.getByRole('button', { name: '新建对话', exact: true }).click()
+  await expect(page.getByLabel('会话列表')).toHaveValue('conversation-1')
+  await expect(page.getByText('想从哪里开始？')).toBeVisible()
+  await expect(page.getByLabel('给 Agent 的指令')).toHaveValue('')
+  await expect(page.getByText('旧对话的请求', { exact: true })).toHaveCount(0)
+  await page.getByLabel('给 Agent 的指令').fill('新对话草稿')
+  await page.getByLabel('会话列表').selectOption('default')
+  await expect(page.getByLabel('给 Agent 的指令')).toHaveValue('旧对话的草稿')
+  await expect(page.getByText('旧对话的请求', { exact: true })).toBeVisible()
+  await page.getByLabel('会话列表').selectOption('conversation-1')
+  await expect(page.getByLabel('给 Agent 的指令')).toHaveValue('新对话草稿')
+  await page.getByRole('button', { name: '发送指令', exact: true }).click()
+  await expect(page.getByLabel('会话列表')).toContainText('新对话草稿')
+  expect(state.messages[1].conversation_id).toBe('conversation-1')
+  await page.getByRole('button', { name: '重命名对话' }).click()
+  await page.getByLabel('对话名称').fill('B站上传安排')
+  await page.locator('.agent-rename').getByRole('button', { name: '保存', exact: true }).click()
+  await expect(page.getByLabel('会话列表')).toContainText('B站上传安排')
+  await page.screenshot({ path: 'test-results/agent-conversations.png' })
+  await page.reload()
+  await page.getByRole('button', { name: 'Agent 助手', exact: true }).click()
+  await expect(page.getByLabel('会话列表')).toHaveValue('conversation-1')
+  await expect(page.getByText('新对话草稿', { exact: true })).toBeVisible()
+  await expect(page.getByText('旧对话的请求', { exact: true })).toHaveCount(0)
+})
+
+test('another running conversation keeps new conversation read-only until idle', async ({ page }) => {
+  const state = await setup(page)
+  state.runs.push({ id: 'running', conversation_id: 'default', message: '执行中', status: 'running', action: null })
+  await page.getByRole('button', { name: 'Agent 助手', exact: true }).click()
+  await page.getByRole('button', { name: '新建对话', exact: true }).click()
+  await expect(page.getByLabel('会话列表')).toHaveValue('conversation-1')
+  await expect(page.getByLabel('给 Agent 的指令')).toBeDisabled()
+  state.runs[0].status = 'completed'
+  await page.getByRole('button', { name: '刷新对话' }).click()
+  await expect(page.getByLabel('给 Agent 的指令')).toBeEnabled()
+})
+
+test('stale saved conversation falls back to project history', async ({ page }) => {
+  await setup(page)
+  await page.evaluate(() => localStorage.setItem('alexandria-agent-conversation:book', 'missing'))
+  await page.reload()
+  await page.getByRole('button', { name: 'Agent 助手', exact: true }).click()
+  await expect(page.getByLabel('会话列表')).toHaveValue('default')
+  await expect(page.getByText('想从哪里开始？')).toBeVisible()
+  await expect(page).toHaveURL('/projects/book')
 })
 
 test('previews a script change and applies it only after confirmation', async ({ page }) => {
@@ -240,4 +330,123 @@ test('closing the window keeps polling the active request until completion', asy
   await expect(page.locator('.agent-live-dot')).toHaveCount(0)
   await page.getByRole('button', { name: 'Agent 助手', exact: true }).click()
   await expect(page.getByText('后台处理已完成')).toBeVisible()
+})
+
+test('batch saves need no permission flags and survive a lost response', async ({ page }) => {
+  const state = await setup(page)
+  state.batch()
+  await page.getByRole('button', { name: 'Agent 助手', exact: true }).click()
+  await expect(page.getByLabel('允许直接修改本项目脚本')).toHaveCount(0)
+  await expect(page.getByLabel('本条指令允许改写正文')).toHaveCount(0)
+  state.disconnect()
+  await page.getByLabel('给 Agent 的指令').fill('批量删除章节开头的重复书名')
+  await page.getByRole('button', { name: '发送指令', exact: true }).click()
+  await expect(page.locator('.agent-error')).toBeVisible()
+  await page.getByRole('button', { name: '发送指令', exact: true }).click()
+  await expect(page.getByText('批量脚本修改 · 已保存')).toBeVisible()
+  await expect(page.getByText('修改 1 章 · 跳过 2 章')).toBeVisible()
+  await expect(page.getByRole('button', { name: '确认保存脚本' })).toHaveCount(0)
+  await page.locator('.agent-diff summary').click()
+  await expect(page.locator('.agent-diff pre').last()).toContainText('正文保留。')
+  await expect(page.getByLabel('文本', { exact: true })).toHaveValue('正文保留。')
+  expect(state.messages).toHaveLength(2)
+  expect(state.messages[0].request_id).toBe(state.messages[1].request_id)
+  expect(state.script.revision).toBe(2)
+  expect(state.decisions).toHaveLength(0)
+  await page.reload()
+  await page.getByRole('button', { name: 'Agent 助手', exact: true }).click()
+  await expect(page.getByText('批量脚本修改 · 已保存')).toBeVisible()
+})
+
+test('conversation and draft do not leak into another project', async ({ page }) => {
+  const state = await setup(page)
+  state.settings.agent_auto_apply_scripts = true
+  await page.reload()
+  await page.getByRole('button', { name: 'Agent 助手', exact: true }).click()
+  await expect(page.getByLabel('允许直接修改本项目脚本')).toHaveCount(0)
+  await page.getByLabel('给 Agent 的指令').fill('上一个项目草稿')
+  await page.route('**/api/v1/projects/other**', async route => {
+    const path = new URL(route.request().url()).pathname
+    const json = path.endsWith('/other') ? { id: 'other', title: '另一项目', settings: { agent_auto_apply_scripts: false }, latest_job: null, chapter_count: 0 }
+      : path.endsWith('/agent') ? { runs: [] } : path.endsWith('/voice-pool') ? {} : []
+    await route.fulfill({ json })
+  })
+  await page.goto('/projects/other')
+  await page.getByRole('button', { name: 'Agent 助手', exact: true }).click()
+  await expect(page.getByLabel('允许直接修改本项目脚本')).toHaveCount(0)
+  await expect(page.getByLabel('给 Agent 的指令')).toHaveValue('')
+})
+
+test('batch completion preserves unsaved local edits', async ({ page }) => {
+  const state = await setup(page)
+  state.settings.agent_auto_apply_scripts = true
+  await page.reload()
+  const run: any = { id: 'running-batch', message: '删除重复书名', output: '', status: 'running', created_at: new Date().toISOString(), action: null }
+  state.runs.push(run)
+  await page.getByRole('button', { name: 'Agent 助手', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Agent 处理中', exact: true })).toBeDisabled()
+  await page.getByLabel('文本', { exact: true }).fill('未保存人工修改')
+  state.script.revision = 2
+  state.script.entries = [{ speaker: 'NARRATOR', text: '服务器已清理。', instruct: '平静' }]
+  run.status = 'completed'
+  run.output = '批量完成'
+  run.action = { id: 'batch-done', kind: 'script_batch', status: 'applied', args: { changes: [], skipped_count: 0 }, result: { modified_count: 1 } }
+  await expect(page.getByText('批量脚本修改 · 已保存')).toBeVisible()
+  await expect(page.getByLabel('文本', { exact: true })).toHaveValue('未保存人工修改')
+  await expect(page.getByText('章节有未保存的人工编辑', { exact: false })).toBeVisible()
+})
+
+
+test('all operations are shown in order and restored after reload', async ({ page }) => {
+  const state = await setup(page)
+  const actions = [
+    { id: 'a-1', kind: 'project', status: 'completed', args: { title: '新标题' }, result: {} },
+    { id: 'a-2', kind: 'task', status: 'completed', args: {}, result: { id: 'upload-10' } },
+  ]
+  state.runs.push({ id: 'multi-run', message: '改标题并追加10个分P', status: 'completed', output: '已修改标题并提交追加任务。', actions, action: actions[0] })
+  await page.getByRole('button', { name: 'Agent 助手', exact: true }).click()
+  await expect(page.locator('.agent-action')).toHaveCount(2)
+  await expect(page.locator('.agent-action').first()).toContainText('操作已完成')
+  await expect(page.locator('.agent-action').last()).toContainText('任务编号：upload-10')
+  await page.reload()
+  await page.getByRole('button', { name: 'Agent 助手', exact: true }).click()
+  await expect(page.locator('.agent-action')).toHaveCount(2)
+})
+
+test('project schedules show results and support pause resume and delete', async ({ page }) => {
+  const state = await setup(page)
+  state.automations.push({ id: 'plan-1', instruction: '给当前稿件追加最多10个已准备的分P', interval_seconds: 600, enabled: true,
+    next_run_at: '2026-10-29T02:10:00Z', selected_chapter_id: 1, paused_reason: '', last_run_id: 'scheduled-run',
+    last_run: { id: 'scheduled-run', status: 'completed', output: '已提交10个分P的追加任务。', created_at: '2026-10-29T02:00:00Z' } })
+  await page.getByRole('button', { name: '定时任务', exact: true }).click()
+  await expect(page.getByText('已启用 · 每 10 分钟')).toBeVisible()
+  await expect(page.getByText('已提交10个分P的追加任务。', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: '暂停计划 plan-1', exact: true }).click()
+  await expect(page.getByText('已暂停 · 每 10 分钟')).toBeVisible()
+  state.automations[0].paused_reason = 'B站账号已过期，请重新登录'
+  await page.getByRole('button', { name: '刷新定时任务' }).click()
+  await expect(page.getByText('B站账号已过期，请重新登录')).toBeVisible()
+  await page.screenshot({ path: 'test-results/project-automations.png', fullPage: true })
+  await page.getByRole('button', { name: '恢复计划 plan-1', exact: true }).click()
+  await expect(page.getByText('已启用 · 每 10 分钟')).toBeVisible()
+  await page.getByRole('button', { name: '删除计划 plan-1', exact: true }).click()
+  await expect(page.getByText('暂无定时任务。')).toBeVisible()
+})
+
+test('project deletion stops agent polling and returns to project list', async ({ page }) => {
+  await setup(page)
+  await page.route('**/api/v1/projects', route => route.fulfill({ json: [] }))
+  let deleted = false
+  await page.route('**/api/v1/projects/book/agent**', async route => {
+    if (route.request().method() === 'POST') {
+      deleted = true
+      return route.fulfill({ status: 202, json: { id: 'delete-run', status: 'running', message: '删除项目', action: null, actions: [] } })
+    }
+    return route.fulfill({ status: deleted ? 404 : 200, json: deleted ? { detail: 'Not found' } : { runs: [] } })
+  })
+  await page.getByRole('button', { name: 'Agent 助手', exact: true }).click()
+  await page.getByLabel('给 Agent 的指令').fill('删除当前项目')
+  await page.getByRole('button', { name: '发送指令', exact: true }).click()
+  await expect(page).toHaveURL('/')
+  await expect(page.getByRole('dialog', { name: '项目 Agent' })).toHaveCount(0)
 })

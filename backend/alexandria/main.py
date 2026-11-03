@@ -102,7 +102,7 @@ def create_app(data_dir: Path | None = None, *, start_scheduler: bool = True) ->
         bilibili = BilibiliService(repository)
         runner = PipelineRunner(repository, executor, broker, bilibili)
         scheduler = Scheduler(repository, runner)
-        agent = ProjectAgent(repository)
+        agent = ProjectAgent(repository, bilibili)
     except Exception:
         database.close()
         raise
@@ -112,9 +112,13 @@ def create_app(data_dir: Path | None = None, *, start_scheduler: bool = True) ->
         broker.bind_loop(asyncio.get_running_loop())
         if start_scheduler:
             scheduler.start()
+        automation_task = asyncio.create_task(agent.automations.run()) if start_scheduler else None
         try:
             yield
         finally:
+            if automation_task:
+                automation_task.cancel()
+                await asyncio.gather(automation_task, return_exceptions=True)
             await agent.close()
             scheduler.stop()
             database.close()

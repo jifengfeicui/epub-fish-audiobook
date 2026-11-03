@@ -8,7 +8,7 @@ import aiofiles
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 
-from backend.alexandria.api.schemas import AgentMessage, AgentDecision, BilibiliJobCreate, BilibiliReconcile, ChapterListUpdate, CharacterListUpdate, JobCreate, ProjectUpdate, ProjectVoicePoolUpdate, ScriptUpdate, SettingsUpdate, VoiceListUpdate, VoiceValidationInput
+from backend.alexandria.api.schemas import AgentConversationTitle, AgentMessage, AgentDecision, AutomationCreate, AutomationUpdate, BilibiliJobCreate, BilibiliReconcile, ChapterListUpdate, CharacterListUpdate, JobCreate, ProjectUpdate, ProjectVoicePoolUpdate, ScriptUpdate, SettingsUpdate, VoiceListUpdate, VoiceValidationInput
 from backend.alexandria.db.repository import Repository
 from backend.alexandria.domain.pipeline import RENDER_START_MODES
 
@@ -28,7 +28,7 @@ def _http_error(exc: Exception) -> HTTPException:
         "agent_request_conflict": (409, "请求编号已用于另一条消息，请重新发送"),
         "agent_proposal_closed": (409, "提案已处理或过期，请重新读取脚本后生成提案"),
         "agent_interrupted": (409, "Agent 已中断，请检查已执行的操作"),
-        "agent_one_action": (409, "每轮只允许一个写操作，请另发一条明确指令"),
+        "agent_script_permission_revoked": (409, "本轮未获直接改稿授权或权限已关闭，脚本未保存"),
         "active_job": (409, "另一个任务正在运行"),
         "invalid_llm_profiles": (422, "LLM 配置无效：请检查名称、HTTP(S) 服务地址、模型、唯一 ID 和当前选择"),
         "invalid_llm_api_key": (422, "新 LLM 配置不能使用密钥掩码，请输入 API Key 或留空"),
@@ -86,9 +86,33 @@ def health():
 
 
 @router.get("/projects/{project_id}/agent")
-def agent_conversation(project_id: str, request: Request):
+def agent_conversation(project_id: str, request: Request, conversation_id: uuid.UUID | None = None):
     try:
-        return request.app.state.agent.store.conversation(project_id)
+        return request.app.state.agent.store.conversation(project_id, conversation_id)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/projects/{project_id}/agent/conversations")
+def agent_conversations(project_id: str, request: Request):
+    try:
+        return {"conversations": request.app.state.agent.store.conversations(project_id)}
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/projects/{project_id}/agent/conversations", status_code=201)
+def create_agent_conversation(project_id: str, payload: AgentConversationTitle, request: Request):
+    try:
+        return request.app.state.agent.store.create_conversation(project_id, payload.title)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.patch("/projects/{project_id}/agent/conversations/{conversation_id}")
+def rename_agent_conversation(project_id: str, conversation_id: uuid.UUID, payload: AgentConversationTitle, request: Request):
+    try:
+        return request.app.state.agent.store.rename_conversation(project_id, conversation_id, payload.title)
     except Exception as exc:
         raise _http_error(exc) from exc
 
@@ -120,6 +144,38 @@ def agent_decision(project_id: str, proposal_id: str, payload: AgentDecision, re
 @router.get("/projects")
 def list_projects(request: Request, archived: bool = False):
     return _repo(request).list_projects(archived=archived)
+
+
+@router.get("/projects/{project_id}/automations")
+def list_automations(project_id: str, request: Request):
+    try:
+        return {"automations": request.app.state.agent.automations.list(project_id)}
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/projects/{project_id}/automations", status_code=201)
+def create_automation(project_id: str, payload: AutomationCreate, request: Request):
+    try:
+        return request.app.state.agent.automations.create(project_id, payload)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.patch("/projects/{project_id}/automations/{automation_id}")
+def update_automation(project_id: str, automation_id: str, payload: AutomationUpdate, request: Request):
+    try:
+        return request.app.state.agent.automations.update(project_id, automation_id, payload)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.delete("/projects/{project_id}/automations/{automation_id}", status_code=204)
+def delete_automation(project_id: str, automation_id: str, request: Request):
+    try:
+        request.app.state.agent.automations.delete(project_id, automation_id)
+    except Exception as exc:
+        raise _http_error(exc) from exc
 
 
 @router.post("/projects", status_code=201)

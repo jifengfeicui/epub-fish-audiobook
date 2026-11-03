@@ -7,7 +7,7 @@ export function notifyError(message: string) {
   if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('app-error', { detail: text }))
 }
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+async function request<T>(path: string, options: RequestInit = {}, silentNotFound = false): Promise<T> {
   const response = await fetch(path, options)
   if (!response.ok) {
     let detail = `请求失败 (${response.status})`
@@ -15,14 +15,14 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
       const body = await response.json()
       detail = typeof body.detail === 'string' ? body.detail : body.detail?.message || detail
     } catch { /* response is not JSON */ }
-    notifyError(detail)
-    throw new Error(detail)
+    if (!(silentNotFound && response.status === 404)) notifyError(detail)
+    throw Object.assign(new Error(detail), { status: response.status })
   }
   return (response.status === 204 ? undefined : await response.json()) as T
 }
 
 export const api = {
-  get: <T>(path: string) => request<T>(path),
+  get: <T>(path: string, options?: { silentNotFound?: boolean }) => request<T>(path, {}, options?.silentNotFound),
   post: <T>(path: string, body?: unknown) => request<T>(path, {
     method: 'POST',
     headers: body === undefined ? undefined : JSON_HEADERS,

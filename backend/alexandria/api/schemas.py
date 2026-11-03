@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated, Any, Literal, Optional, Union
 from uuid import UUID
 
@@ -12,6 +13,7 @@ UploadLine = Literal["cnbldsa", "bda2", "txa", "alia"]
 
 
 class ProjectUpdate(BaseModel):
+    agent_auto_apply_scripts: Optional[bool] = None
     title: Optional[str] = Field(default=None, min_length=1, max_length=300)
     render_start_mode: Optional[RenderStartMode] = None
     release_batch_size: Optional[int] = Field(default=None, ge=1, le=20)
@@ -57,6 +59,7 @@ class ScriptUpdate(BaseModel):
 
 class AgentMessage(BaseModel):
     request_id: UUID
+    conversation_id: Optional[UUID] = None
     message: str = Field(min_length=1, max_length=8000)
     selected_chapter_id: Optional[int] = Field(default=None, ge=1)
     allow_text_rewrite: bool = False
@@ -71,6 +74,59 @@ class AgentMessage(BaseModel):
 
 class AgentDecision(BaseModel):
     approve: bool
+
+
+class AgentConversationTitle(BaseModel):
+    title: str = Field(default="新对话", min_length=1, max_length=100)
+
+    @field_validator("title")
+    @classmethod
+    def strip_title(cls, value):
+        return AgentMessage.strip_message(value)
+
+
+class AutomationCreate(BaseModel):
+    instruction: str = Field(min_length=1, max_length=8000)
+    interval_seconds: int = Field(ge=60)
+    first_run_at: Optional[datetime] = None
+    selected_chapter_id: Optional[int] = Field(default=None, ge=1)
+
+    @field_validator("instruction")
+    @classmethod
+    def strip_instruction(cls, value: str) -> str:
+        return AgentMessage.strip_message(value)
+
+    @field_validator("first_run_at")
+    @classmethod
+    def require_timezone(cls, value):
+        if value is not None and value.tzinfo is None:
+            raise ValueError("首次执行时间必须包含时区")
+        return value
+
+
+class AutomationUpdate(BaseModel):
+    instruction: Optional[str] = Field(default=None, min_length=1, max_length=8000)
+    interval_seconds: Optional[int] = Field(default=None, ge=60)
+    enabled: Optional[bool] = None
+    next_run_at: Optional[datetime] = None
+
+    @field_validator("instruction")
+    @classmethod
+    def strip_instruction(cls, value):
+        return AgentMessage.strip_message(value) if value is not None else value
+
+    @field_validator("next_run_at")
+    @classmethod
+    def require_timezone(cls, value):
+        return AutomationCreate.require_timezone(value)
+
+
+class AgentProjectUpdate(ProjectUpdate):
+    model_config = {"extra": "forbid"}
+
+
+class ScriptBatchEntry(ScriptUpdate):
+    chapter_id: int = Field(ge=1)
 
 
 class JobCreate(BaseModel):

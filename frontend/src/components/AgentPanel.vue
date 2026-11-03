@@ -1,14 +1,21 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
-import { ArrowUp, BookOpenText, Grip, MessageSquare, RefreshCw, Sparkles, X } from 'lucide-vue-next'
+import { ArrowUp, BookOpenText, Grip, MessageSquare, Pencil, Plus, RefreshCw, Sparkles, X } from 'lucide-vue-next'
 import { api } from '../api/client'
-import type { AgentAction, AgentRun, Chapter, ScriptEntry } from '../types'
+import type { AgentAction, AgentConversation, AgentRun, Chapter, ScriptChange, ScriptEntry } from '../types'
 
 const props = defineProps<{ projectId: string; chapters: Chapter[]; selectedChapterId: number | null; chapterTitle?: string; dirty: boolean; editable: boolean; saving: boolean }>()
-const emit = defineEmits<{ changed: []; save: []; discard: [] }>()
+const emit = defineEmits<{ changed: []; save: []; discard: []; deleted: [] }>()
 const runs = ref<AgentRun[]>([])
+const conversations = ref<AgentConversation[]>([])
+const selectionKey = `alexandria-agent-conversation:${props.projectId}`
+const conversationId = ref(localStorage.getItem(selectionKey) || '')
+const projectBusy = ref(false)
+const conversationSaving = ref(false)
+const renaming = ref(false)
+const conversationTitle = ref('')
+const drafts = new Map<string, string>()
 const draft = ref('')
-const allowRewrite = ref(false)
 const sending = ref(false)
 const deciding = ref(false)
 const error = ref('')
@@ -22,12 +29,14 @@ const bounds = ref({ x: 0, y: 0, width: 460, height: 640 })
 const windowStyle = computed(() => ({ left: `${bounds.value.x}px`, top: `${bounds.value.y}px`, width: `${bounds.value.width}px`, height: `${bounds.value.height}px` }))
 let initialized = false
 let gesture: { x: number; y: number; bounds: typeof bounds.value; resize: boolean } | undefined
-const busy = computed(() => runs.value.some(run => run.status === 'running'))
+const busy = computed(() => projectBusy.value || runs.value.some(run => run.status === 'running'))
 const base = `/api/v1/projects/${props.projectId}/agent`
 let timer = 0
 let stopped = false
+let loadVersion = 0
 let submission: { signature: string; id: string } | undefined
 const statusNames: Record<string, string> = { running: '处理中', completed: '本轮已处理', failed: '失败', interrupted: '已中断', pending: '待确认', applied: '已保存', rejected: '已拒绝', outdated: '已过期', executing: '正在提交' }
+const operationNames: Record<string, string> = { task: '创建任务', control: '控制任务', project: '修改项目', chapters: '选择章节', characters: '修改角色', characters_refresh: '更新角色池', voice_pool: '修改项目音色池', automation_create: '创建定时任务', automation_update: '修改定时任务', automation_pause: '暂停定时任务', automation_delete: '删除定时任务', reparse: '重新识别章节' }
 
 function fitWindow() {
   const b = bounds.value
@@ -45,8 +54,8 @@ async function toggle() {
     bounds.value.x = window.innerWidth - 484
     bounds.value.y = window.innerHeight - 720
     fitWindow()
-    void load()
   }
+  void load()
   await nextTick()
   if (followLatest.value && history.value) history.value.scrollTop = history.value.scrollHeight
   composer.value?.focus({ preventScroll: true })
@@ -91,25 +100,74 @@ function composeKey(event: KeyboardEvent) {
 
 async function load() {
   window.clearTimeout(timer)
+  const version = ++loadVersion
+  const selected = conversationId.value
   try {
-    const result = await api.get<{ runs: AgentRun[] }>(base)
-    if (stopped) return
-    const wasBusy = busy.value
+    const result = await api.get<{ runs: AgentRun[]; conversations: AgentConversation[]; conversation_id: string; project_busy: boolean }>(selected ? `${base}?conversation_id=${encodeURIComponent(selected)}` : base, { silentNotFound: true })
+    if (stopped || version !== loadVersion) return
+    const changed = JSON.stringify(result.runs) !== JSON.stringify(runs.value)
     runs.value = result.runs
+    conversations.value = result.conversations
+    conversationId.value = result.conversation_id
+    projectBusy.value = result.project_busy
+    localStorage.setItem(selectionKey, result.conversation_id)
     error.value = ''
     await nextTick()
     if (opened.value && followLatest.value && history.value) history.value.scrollTop = history.value.scrollHeight
-    if (wasBusy && !busy.value) emit('changed')
-  } catch (reason) { error.value = (reason as Error).message }
-  finally {
-    loading.value = false
-    if (!stopped && (busy.value || error.value)) timer = window.setTimeout(() => { void load() }, 1500)
+    if (changed && runs.value.some(run => run.status !== 'running')) emit('changed')
+  } catch (reason) {
+    if (stopped || version !== loadVersion) return
+    if ((reason as Error & { status?: number }).status === 404) {
+      if (selected) { conversationId.value = ''; await load(); return }
+      stopped = true; emit('deleted'); return
+    }
+    error.value = (reason as Error).message
   }
+  finally {
+    if (version === loadVersion) {
+      loading.value = false
+      if (!stopped && (opened.value || busy.value || error.value)) timer = window.setTimeout(() => { void load() }, 1500)
+    }
+  }
+}
+
+async function switchConversation(id: string) {
+  drafts.set(conversationId.value, draft.value)
+  conversationId.value = id
+  draft.value = drafts.get(id) || ''
+  runs.value = []
+  loading.value = true
+  followLatest.value = true
+  renaming.value = false
+  submission = undefined
+  await load()
+}
+
+async function newConversation() {
+  if (sending.value || deciding.value || conversationSaving.value) return
+  conversationSaving.value = true
+  try {
+    const conversation = await api.post<AgentConversation>(`${base}/conversations`, { title: '新对话' })
+    await switchConversation(conversation.id)
+    composer.value?.focus()
+  } catch (reason) { error.value = (reason as Error).message }
+  finally { conversationSaving.value = false }
+}
+
+async function renameConversation() {
+  if (!conversationTitle.value.trim() || conversationSaving.value) return
+  conversationSaving.value = true
+  try {
+    await api.patch(`${base}/conversations/${conversationId.value}`, { title: conversationTitle.value.trim() })
+    renaming.value = false
+    await load()
+  } catch (reason) { error.value = (reason as Error).message }
+  finally { conversationSaving.value = false }
 }
 
 async function send() {
   if (!draft.value.trim() || props.dirty || busy.value || sending.value || loading.value) return
-  const body = { message: draft.value.trim(), selected_chapter_id: props.selectedChapterId, allow_text_rewrite: allowRewrite.value }
+  const body = { conversation_id: conversationId.value, message: draft.value.trim(), selected_chapter_id: props.selectedChapterId }
   const signature = JSON.stringify(body)
   if (submission?.signature !== signature) submission = { signature, id: crypto.randomUUID() }
   sending.value = true
@@ -119,8 +177,9 @@ async function send() {
     if (stopped) return
     if (!runs.value.some(item => item.id === run.id)) runs.value.push(run)
     draft.value = ''
-    allowRewrite.value = false
+    drafts.delete(conversationId.value)
     submission = undefined
+    if (run.status !== 'running') emit('changed')
     await load()
   } catch (reason) { error.value = (reason as Error).message }
   finally { sending.value = false }
@@ -137,9 +196,9 @@ async function decide(action: AgentAction, approve: boolean) {
   finally { deciding.value = false }
 }
 
-function differences(action: AgentAction) {
-  const before = action.args.before || []
-  const after = action.args.entries || []
+function differences(change: ScriptChange) {
+  const before = change.before || []
+  const after = change.entries || []
   return Array.from({ length: Math.max(before.length, after.length) }, (_, index) => ({ index, before: before[index], after: after[index] }))
     .filter(row => JSON.stringify(row.before) !== JSON.stringify(row.after))
 }
@@ -160,36 +219,57 @@ onBeforeUnmount(() => { stopped = true; window.clearTimeout(timer); window.remov
         <div class="agent-title" tabindex="0" aria-label="移动 Agent 窗口，使用方向键" @keydown="adjustWithKeys($event)"><span class="agent-symbol"><Sparkles :size="18" /></span><div><h2>Agent 助手</h2><small>{{ busy ? '正在处理你的请求' : '一起完成这本有声书' }}</small></div></div>
         <div class="agent-header-actions"><button class="agent-icon" aria-label="刷新对话" :disabled="sending || deciding" @click="load"><RefreshCw :size="16" /></button><button class="agent-icon" aria-label="收起 Agent" @click="toggle"><X :size="19" /></button></div>
       </header>
+      <div class="agent-conversations">
+        <select :value="conversationId" aria-label="会话列表" :disabled="sending || deciding || conversationSaving" @change="switchConversation(($event.target as HTMLSelectElement).value)">
+          <option v-for="conversation in conversations" :key="conversation.id" :value="conversation.id">{{ conversation.title }}</option>
+        </select>
+        <button class="agent-icon" aria-label="重命名对话" :disabled="!conversationId || conversationSaving" @click="renaming = !renaming; conversationTitle = conversations.find(item => item.id === conversationId)?.title || ''"><Pencil :size="14" /></button>
+        <button class="agent-new-conversation" :disabled="sending || deciding || conversationSaving" @click="newConversation"><Plus :size="14" />新建对话</button>
+      </div>
+      <form v-if="renaming" class="agent-rename" @submit.prevent="renameConversation">
+        <input v-model="conversationTitle" aria-label="对话名称" maxlength="100" autofocus />
+        <button :disabled="conversationSaving || !conversationTitle.trim()">保存</button><button type="button" @click="renaming = false">取消</button>
+      </form>
       <div ref="history" class="agent-history" role="log" aria-label="Agent 对话记录" aria-live="polite" @scroll="trackScroll">
         <p v-if="loading" class="agent-loading">正在读取对话…</p>
         <div v-else-if="!runs.length" class="agent-welcome"><Sparkles :size="28" /><h3>想从哪里开始？</h3><p>查看进度、安排任务，或一起打磨当前章节。</p><div class="agent-suggestions"><button v-for="suggestion in ['查询任务进度', '把当前章旁白的语气改得沉稳']" :key="suggestion" @click="draft = suggestion; composer?.focus()">{{ suggestion }}<ArrowUp :size="14" /></button></div></div>
         <article v-for="run in runs" :key="run.id" class="agent-turn">
-          <p class="agent-user">{{ run.message }}</p>
+          <small v-if="run.automation_id" class="agent-permission-note">定时唤醒</small><p class="agent-user">{{ run.message }}</p>
           <div class="agent-answer-label"><Sparkles :size="14" /><span>Alexandria</span><small>{{ statusNames[run.status] || run.status }}</small></div>
           <p class="agent-answer">{{ run.output || '正在思考并检查项目状态…' }}</p>
-          <div v-if="run.action" class="agent-action">
-            <template v-if="run.action.kind === 'script'">
-              <strong>脚本修改提案 · {{ statusNames[run.action.status] || run.action.status }}</strong>
-              <p>{{ run.action.args.summary }}</p>
-              <p class="muted">{{ chapters.find(chapter => chapter.id === run.action?.args.chapter_id)?.title || '章节已移除' }} · 基于修订 {{ run.action.args.expected_revision }} · {{ run.action.args.text_changed ? '包含正文修改' : '正文保持不变' }}</p>
-              <div v-for="row in differences(run.action)" :key="row.index" class="agent-diff">
+          <div v-for="action in (run.actions ?? (run.action ? [run.action] : []))" :key="action.id" class="agent-action">
+            <template v-if="action.kind === 'script' || action.kind === 'script_batch'">
+              <strong>{{ action.kind === 'script_batch' ? '批量脚本修改' : action.status === 'pending' || !run.auto_apply_scripts ? '脚本修改提案' : '脚本修改' }} · {{ statusNames[action.status] || action.status }}</strong>
+              <p>{{ action.args.summary }}</p>
+              <template v-if="action.kind === 'script_batch'">
+                <p>修改 {{ action.result.modified_count ?? action.args.changes?.length ?? 0 }} 章 · 跳过 {{ action.args.skipped_count ?? 0 }} 章</p>
+                <details v-for="change in action.args.changes" :key="change.chapter_id" class="agent-diff">
+                  <summary>{{ chapters.find(chapter => chapter.id === change.chapter_id)?.title || `章节 ${change.chapter_id}` }} · 基于修订 {{ change.expected_revision }}</summary>
+                  <div v-for="row in differences(change)" :key="row.index" class="agent-diff-columns"><div><small>修改前</small><pre>{{ content(row.before) }}</pre></div><div><small>修改后</small><pre>{{ content(row.after) }}</pre></div></div>
+                </details>
+              </template>
+              <template v-else>
+              <p class="muted">{{ chapters.find(chapter => chapter.id === action?.args.chapter_id)?.title || '章节已移除' }} · 基于修订 {{ action.args.expected_revision }} · {{ action.args.text_changed ? '包含正文修改' : '正文保持不变' }}</p>
+              <div v-for="row in differences(action.args)" :key="row.index" class="agent-diff">
                 <strong>条目 {{ row.index + 1 }}</strong><div class="agent-diff-columns"><div><small>修改前</small><pre>{{ content(row.before) }}</pre></div><div><small>修改后</small><pre>{{ content(row.after) }}</pre></div></div>
               </div>
-              <template v-if="run.action.status === 'pending'">
+              </template>
+              <p v-if="action.result.message" class="agent-error">{{ action.result.message }}</p>
+              <template v-if="action.status === 'pending'">
                 <p v-if="!editable" class="muted">请先暂停任务，等待暂停完成后再应用提案。</p>
-                <div class="heading-actions"><button class="button secondary" :disabled="deciding || run.status === 'running'" @click="decide(run.action, false)">拒绝修改</button><button class="button primary" :disabled="dirty || !editable || deciding || run.status === 'running'" @click="decide(run.action, true)">确认保存脚本</button></div>
+                <div class="heading-actions"><button class="button secondary" :disabled="deciding || run.status === 'running'" @click="decide(action, false)">拒绝修改</button><button class="button primary" :disabled="dirty || !editable || deciding || run.status === 'running'" @click="decide(action, true)">确认保存脚本</button></div>
               </template>
             </template>
-            <template v-else><strong>{{ run.action.status === 'completed' ? '操作已提交，实际进度见项目面板' : statusNames[run.action.status] || run.action.status }}</strong><p v-if="run.action.result.id">任务编号：{{ run.action.result.id }}</p><p v-if="run.action.result.message">{{ run.action.result.message }}</p></template>
+            <template v-else><strong>{{ action.status === 'completed' ? (action.kind === 'task' || action.kind === 'control' ? '操作已提交，实际进度见项目面板' : '操作已完成') : statusNames[action.status] || action.status }}</strong><p>{{ operationNames[action.kind] || '项目操作' }}</p><p v-if="action.result.id">{{ action.kind === 'task' || action.kind === 'control' ? '任务编号' : '记录编号' }}：{{ action.result.id }}</p><p v-if="action.result.message">{{ action.result.message }}</p></template>
           </div>
         </article>
       </div>
       <form class="agent-compose" @submit.prevent="send">
         <div v-if="dirty" class="agent-notice" role="alert">章节有未保存的人工编辑，请先保存或放弃，再发送指令或应用提案。<div class="agent-notice-actions"><button type="button" :disabled="saving || !editable" @click="emit('save')">保存人工编辑</button><button type="button" :disabled="saving" @click="emit('discard')">放弃人工编辑</button></div></div>
         <div class="agent-context"><BookOpenText :size="13" /><span>当前章：{{ chapterTitle || '未选择' }}</span></div>
-        <div class="agent-input-box"><textarea ref="composer" v-model="draft" aria-label="给 Agent 的指令" maxlength="8000" rows="2" placeholder="询问进度，或描述你想做的修改…" :disabled="sending || busy" @keydown="composeKey" /><div class="agent-input-footer"><label><input v-model="allowRewrite" type="checkbox" :disabled="sending || busy" />本条指令允许改写正文</label><button class="agent-send" :aria-label="busy ? 'Agent 处理中' : sending ? '提交中' : '发送指令'" :disabled="loading || dirty || sending || busy || !draft.trim()"><ArrowUp :size="19" /></button></div></div>
+        <div class="agent-input-box"><textarea ref="composer" v-model="draft" aria-label="给 Agent 的指令" maxlength="8000" rows="2" placeholder="查询进度、修改项目，或安排定时任务…" :disabled="sending || busy" @keydown="composeKey" /><div class="agent-input-footer"><span class="agent-permission-note">按明确指令直接执行</span><button class="agent-send" :aria-label="busy ? 'Agent 处理中' : sending ? '提交中' : '发送指令'" :disabled="loading || dirty || sending || busy || !draft.trim()"><ArrowUp :size="19" /></button></div></div>
         <p v-if="error" role="alert" class="agent-error">{{ error }}</p>
-        <small class="agent-footnote">{{ busy ? '收起窗口后仍会继续处理' : 'Enter 发送 · Shift+Enter 换行 · 改稿确认后保存' }}</small>
+        <small class="agent-footnote">{{ busy ? '收起窗口后仍会继续处理' : 'Enter 发送 · Shift+Enter 换行 · 支持项目操作与定时任务' }}</small>
       </form>
       <button type="button" class="agent-resize" aria-label="调整 Agent 窗口大小，使用方向键" @pointerdown="startGesture($event, true)" @pointermove="moveGesture" @pointerup="gesture = undefined" @lostpointercapture="gesture = undefined" @keydown="adjustWithKeys($event, true)"><Grip :size="14" /></button>
     </section>
@@ -197,6 +277,8 @@ onBeforeUnmount(() => { stopped = true; window.clearTimeout(timer); window.remov
 </template>
 
 <style scoped>
+.agent-conversations { display: flex; align-items: center; gap: 6px; padding: 9px 18px; border-bottom: 1px solid #eee; flex: none; }.agent-conversations select { flex: 1; min-width: 0; padding: 7px; border: 1px solid #e5e5e5; border-radius: 8px; background: white; color: #555; font-size: 12px; text-overflow: ellipsis; }.agent-new-conversation { display: flex; align-items: center; gap: 4px; flex: none; padding: 8px; border: 0; border-radius: 8px; background: #f3f3f3; color: #444; font-size: 12px; }.agent-rename { display: flex; gap: 6px; padding: 8px 18px; }.agent-rename input { flex: 1; min-width: 0; padding: 6px; border: 1px solid #ddd; border-radius: 6px; }.agent-rename button { border: 0; border-radius: 6px; background: #eee; font-size: 12px; }
+.agent-permission { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #555; }.agent-permission input { accent-color: #333; }.agent-permission-note { color: #888; font-size: 10px; line-height: 1.6; }.agent-diff summary { cursor: pointer; font-size: 12px; }
 .agent-launcher { position: fixed; right: 24px; bottom: 20px; z-index: 15; display: flex; align-items: center; gap: 9px; padding: 13px 18px; border: 1px solid #333; border-radius: 999px; background: #242424; color: white; font-size: 13px; font-weight: 600; box-shadow: 0 5px 20px #0002; }
 .agent-live-dot, .pending-dot { width: 7px; height: 7px; border-radius: 50%; background: #8bd8b2; }.pending-dot { background: #f0c56e; }
 .agent-window { position: fixed; z-index: 16; display: flex; flex-direction: column; background: #fff; color: #262626; border: 1px solid #dedede; border-radius: 18px; box-shadow: 0 18px 70px #0002, 0 2px 8px #0001; overflow: hidden; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; }

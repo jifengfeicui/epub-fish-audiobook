@@ -92,3 +92,6 @@ frontend/*.tsbuildinfo
 /bilibili-validation-*/
 /secrets/
 
+
+# Local business roadmap (back up separately)
+/roadmap/

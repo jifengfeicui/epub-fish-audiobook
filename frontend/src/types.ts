@@ -15,6 +15,7 @@ export interface Job {
 }
 
 export interface ProjectSettings {
+  agent_auto_apply_scripts: boolean
   render_start_mode: 'after_review_batch' | 'after_all_reviews'
   release_batch_size: number
   from_chapter: number | null
@@ -78,22 +79,54 @@ export interface Script {
   entries: ScriptEntry[]
 }
 
+export interface ScriptChange {
+  chapter_id?: number
+  expected_revision?: number
+  before?: ScriptEntry[]
+  entries?: ScriptEntry[]
+  text_changed?: boolean
+}
+
 export interface AgentAction {
   id: string
-  kind: 'task' | 'control' | 'script'
+  kind: string
   status: string
-  args: { chapter_id?: number; expected_revision?: number; summary?: string; before?: ScriptEntry[]; entries?: ScriptEntry[]; text_changed?: boolean }
-  result: { id?: string; chapter_id?: number; revision?: number; message?: string }
+  args: ScriptChange & { summary?: string; changes?: ScriptChange[]; skipped_count?: number; [key: string]: unknown }
+  result: { id?: string; chapter_id?: number; revision?: number; message?: string; modified_count?: number; skipped_count?: number; chapters?: Array<{ chapter_id: number; revision: number }>; [key: string]: unknown }
+}
+
+export interface AgentConversation {
+  id: string
+  title: string
+  created_at: string
 }
 
 export interface AgentRun {
   id: string
   request_id: string
+  conversation_id?: string | null
   message: string
   status: 'running' | 'completed' | 'failed' | 'interrupted'
   output: string
   created_at: string
+  auto_apply_scripts?: boolean
+  automation_id?: string | null
+  actions?: AgentAction[]
   action: AgentAction | null
+}
+
+export interface ProjectAutomation {
+  id: string
+  project_id: string
+  instruction: string
+  interval_seconds: number
+  enabled: boolean
+  next_run_at: string
+  selected_chapter_id: number | null
+  last_run_id: string | null
+  last_run?: Pick<AgentRun, 'id' | 'status' | 'output' | 'created_at'> | null
+  paused_reason: string
+  created_at: string
 }
 
 export interface JobEvent {

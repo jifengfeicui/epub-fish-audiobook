@@ -15,6 +15,15 @@ class Base(DeclarativeBase):
     pass
 
 
+class AgentConversation(Base):
+    __tablename__ = "agent_conversations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    title: Mapped[str] = mapped_column(String(100), default="新对话")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class AgentRun(Base):
     __tablename__ = "agent_runs"
     __table_args__ = (
@@ -24,10 +33,13 @@ class AgentRun(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    conversation_id: Mapped[Optional[str]] = mapped_column(ForeignKey("agent_conversations.id", ondelete="CASCADE"), nullable=True, index=True)
     request_id: Mapped[str] = mapped_column(String(36))
     message: Mapped[str] = mapped_column(Text)
     selected_chapter_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    automation_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     allow_text_rewrite: Mapped[bool] = mapped_column(Boolean, default=False)
+    auto_apply_scripts: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("0"))
     status: Mapped[str] = mapped_column(String(20), default="running")
     output: Mapped[str] = mapped_column(Text, default="")
     history_json: Mapped[str] = mapped_column(Text, default="[]")
@@ -36,14 +48,33 @@ class AgentRun(Base):
 
 class AgentAction(Base):
     __tablename__ = "agent_actions"
-    __table_args__ = (UniqueConstraint("run_id"),)
+    __table_args__ = (UniqueConstraint("run_id", "position"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     run_id: Mapped[str] = mapped_column(ForeignKey("agent_runs.id", ondelete="CASCADE"), index=True)
+    position: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
     kind: Mapped[str] = mapped_column(String(20))
     status: Mapped[str] = mapped_column(String(20))
     args_json: Mapped[str] = mapped_column(Text)
     result_json: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class ProjectAutomation(Base):
+    __tablename__ = "project_automations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    instruction: Mapped[str] = mapped_column(Text)
+    interval_seconds: Mapped[int] = mapped_column(Integer)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    next_run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    selected_chapter_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    selected_chapter_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    last_run_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    acknowledged_run_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    acknowledged_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    paused_reason: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class Project(Base):
@@ -67,6 +98,7 @@ class ProjectSettings(Base):
     __tablename__ = "project_settings"
 
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True)
+    agent_auto_apply_scripts: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("0"))
     render_start_mode: Mapped[str] = mapped_column(String(32), default="after_review_batch")
     release_batch_size: Mapped[int] = mapped_column(Integer, default=3)
     from_chapter: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)

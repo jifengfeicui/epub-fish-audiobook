@@ -150,6 +150,7 @@ class Repository:
             "updated_at": _iso(project.updated_at),
             "archived_at": _iso(project.archived_at),
             "settings": {
+                "agent_auto_apply_scripts": settings.agent_auto_apply_scripts,
                 "render_start_mode": settings.render_start_mode,
                 "release_batch_size": settings.release_batch_size,
                 "from_chapter": settings.from_chapter,
@@ -171,7 +172,7 @@ class Repository:
             active = session.scalar(
                 select(Job.id).where(Job.project_id == project_id, Job.status.in_(ACTIVE_JOB_STATES)).limit(1)
             )
-            if active and any(key != "title" for key in values):
+            if active and any(key not in ("title", "agent_auto_apply_scripts") for key in values):
                 raise RuntimeError("project_running")
             archived = values.pop("archived", None)
             if archived is not None:
@@ -189,9 +190,10 @@ class Repository:
             project.updated_at = utcnow()
         return self.get_project(project_id)
 
-    def delete_project(self, project_id: str) -> None:
+    def delete_project(self, project_id: str, *, agent_run_id: str | None = None) -> None:
         with self.db.session() as session, session.begin():
-            if session.scalar(select(AgentRun.id).where(AgentRun.project_id == project_id, AgentRun.status == "running")):
+            if session.scalar(select(AgentRun.id).where(AgentRun.project_id == project_id, AgentRun.status == "running",
+                                                       AgentRun.id != (agent_run_id or ""))):
                 raise RuntimeError("agent_busy")
             project = session.get(Project, project_id)
             if project is None:
@@ -204,7 +206,7 @@ class Repository:
             session.delete(project)
         shutil.rmtree(self.storage_root / "projects" / project_id, ignore_errors=True)
 
-    def reparse_project(self, project_id: str) -> dict[str, Any]:
+    def reparse_project(self, project_id: str, *, agent_run_id: str | None = None) -> dict[str, Any]:
         from tools.render_book import inspect_book
 
         bilibili_dir = self.storage_root / "projects" / project_id / "bilibili"
@@ -225,7 +227,8 @@ class Repository:
         with self.db.session() as session, session.begin():
             record = session.get(Project, project_id)
             active = session.scalar(select(Job.id).where(Job.project_id == project_id, Job.status.in_(ACTIVE_JOB_STATES)).limit(1))
-            if session.scalar(select(AgentRun.id).where(AgentRun.project_id == project_id, AgentRun.status == "running")):
+            if session.scalar(select(AgentRun.id).where(AgentRun.project_id == project_id, AgentRun.status == "running",
+                                                       AgentRun.id != (agent_run_id or ""))):
                 raise RuntimeError("agent_busy")
             if active:
                 raise RuntimeError("project_running")
